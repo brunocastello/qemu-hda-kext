@@ -125,6 +125,13 @@ Depois de editar: `sudo touch /System/Library/Extensions` e reiniciar (ou `sudo 
 4. **Ainda martela** → subir `QemuHDASampleOffset` (8192); ver nas stats o maior intervalo de poll — mede a latência do convidado.
 5. A versão exata do IOAudioFamily no 10.6.8 do usuário: `kextstat | grep IOAudioFamily` (esperado 1.8.x). Se for menor que 1.8.3, trocar `IOAF_TAG` em `scripts/fetch-deps.sh` para a tag correspondente.
 
+## Diagnóstico em andamento (2026-10-22, build 0.1.1, 10.6.8)
+
+- Carrega, sons de sistema curtos tocam. `say` não toca nada; QuickTime toca ~2 s e silencia (vídeo continua).
+- Stats: o HAL continua chamando o clip (237 × 512 frames por período), `lead` ~4450–5080 (saudável, não está atrasado), mas o **mix chega todo zerado** (`silent` = todas as chamadas) depois de ~2 s. Ou seja, o cliente/HAL passou a mandar silêncio; não é posição errada nem buffer grande demais.
+- **Pista forte:** por período de "2 s" (relógio do convidado) o DMA anda ~7 voltas = ~117 760 frames → **~58 800 frames/s no tempo do convidado, 1,33× os 44 100 nominais**. O QEMU puxa no ritmo real (senão o FIFO de 8 KiB dele estouraria), então a hipótese é que o **relógio do convidado (TSC/mach_absolute_time) anda a ~0,75× do tempo real** sob TCG (no host ARM64 o TSC do TCG vem de `cntvct_el0`, 24 MHz; o xnu 10.6 calcula a frequência do TSC a partir de FSBFrequency × ratio do MSR). O HAL vê o dispositivo 33 % rápido e os clientes passam a mandar silêncio. Isso também explicaria a "martelada" do usb-audio.
+- Próximo: confirmar com `time sleep 60` no convidado vs cronômetro no host e `sysctl machdep.tsc hw.busfrequency`; se confirmado, corrigir FSBFrequency (DataHub do OpenCore) em vez de mexer no driver.
+
 ## Próximos passos
 
 - ~~Primeiro build no Actions~~ (ok).
