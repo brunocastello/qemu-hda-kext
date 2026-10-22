@@ -25,6 +25,8 @@ OSDefineMetaClassAndStructors(QemuHDAAudioEngine, IOAudioEngine)
 
 #define QHDA_STATS_PERIOD_NS (2ULL * 1000000000ULL)
 
+#define DIRNAME (fDir == kQemuHDAOutput ? "output" : "input")
+
 static inline UInt64 absToNs(UInt64 abs)
 {
     UInt64 ns;
@@ -41,12 +43,13 @@ static inline UInt64 nsToAbs(UInt64 ns)
 
 /* ------------------------------------------------------------------------ */
 
-bool QemuHDAAudioEngine::init(QemuHDAAudioDevice *device)
+bool QemuHDAAudioEngine::init(QemuHDAAudioDevice *device, QemuHDADirection dir)
 {
     if (!device || !super::init(NULL)) {
         return false;
     }
     fDevice      = device;
+    fDir         = dir;
     fVolume      = QHDA_VOLUME_MAX;
     fMuted       = false;
     fRunning     = false;
@@ -78,19 +81,26 @@ bool QemuHDAAudioEngine::initHardware(IOService *provider)
     fPollMs              = fDevice->getUIntProperty("QemuHDAPollIntervalMs", 5, 1, 50);
     fIdleStopSec         = fDevice->getUIntProperty("QemuHDAIdleStopSec", 0, 0, 3600);
 
-    rate.whole = fDevice->getOutputRate();
+    rate.whole = fDevice->getRate(fDir);
     rate.fraction = 0;
     setSampleRate(&rate);
     setNumSampleFramesPerBuffer(QHDA_NUM_FRAMES);
     setSampleOffset(sampleOffset);
-    setOutputSampleLatency(sampleLatency);
-    setDescription("QEMU HDA Line Out");
+    if (fDir == kQemuHDAOutput) {
+        setOutputSampleLatency(sampleLatency);
+        setDescription("QEMU HDA Line Out");
+    } else {
+        setInputSampleLatency(sampleLatency);
+        setDescription("QEMU HDA Line In");
+    }
 
-    /* Output stream: the DMA ring itself is the sample buffer. */
-    fOutStream = new IOAudioStream;
-    if (!fOutStream || !fOutStream->initWithAudioEngine(this, kIOAudioStreamDirectionOutput, 1, "Line Out")) {
-        QLOG(0, "cannot create output stream");
-        if (fOutStream) { fOutStream->release(); fOutStream = NULL; }
+    /* One stream per engine; the DMA ring itself is the sample buffer. */
+    fStream = new IOAudioStream;
+    if (!fStream || !fStream->initWithAudioEngine(this,
+            fDir == kQemuHDAOutput ? kIOAudioStreamDirectionOutput : kIOAudioStreamDirectionInput,
+            1, fDir == kQemuHDAOutput ? "Line Out" : "Line In")) {
+        QLOG(0, "cannot create %s stream", DIRNAME);
+        if (fStream) { fStream->release(); fStream = NULL; }
         return false;
     }
 
@@ -106,19 +116,19 @@ bool QemuHDAAudioEngine::initHardware(IOService *provider)
         0                                               /* fDriverTag */
     };
 
-    fOutStream->setSampleBuffer(fDevice->getOutputBuffer(), QHDA_BUFFER_BYTES);
+    fStream->setSampleBuffer(fDevice->getBuffer(fDir), QHDA_BUFFER_BYTES);
     {
         /* Both rates QEMU's codec handles natively. 44.1 kHz matches QEMU's
          * default -audiodev frequency, so no resampling happens in QEMU. */
         IOAudioSampleRate r44 = { 44100, 0 };
         IOAudioSampleRate r48 = { 48000, 0 };
-        fOutStream->addAvailableFormat(&format, &r44, &r44);
-        fOutStream->addAvailableFormat(&format, &r48, &r48);
+        fStream->addAvailableFormat(&format, &r44, &r44);
+        fStream->addAvailableFormat(&format, &r48, &r48);
     }
-    fOutStream->setFormat(&format);
-    fOutStream->setTerminalType(EXTERNAL_LINE_CONNECTOR);
-    addAudioStream(fOutStream);
-    fOutStream->release();          /* the engine keeps its own reference */
+    fStream->setFormat(&format);
+    fStream->setTerminalType(EXTERNAL_LINE_CONNECTOR);
+    addAudioStream(fStream);
+    fStream->release();             /* the engine keeps its own reference */
 
     if (!createControls()) {
         return false;
@@ -134,8 +144,8 @@ bool QemuHDAAudioEngine::initHardware(IOService *provider)
         return false;
     }
 
-    QLOG(1, "engine ready: %u Hz, %u frames ring, sample offset %u, latency %u, poll %u ms",
-         (unsigned)rate.whole, (unsigned)QHDA_NUM_FRAMES, (unsigned)sampleOffset,
+    QLOG(1, "%s engine ready: %u Hz, %u frames ring, sample offset %u, latency %u, poll %u ms",
+         DIRNAME, (unsigned)rate.whole, (unsigned)QHDA_NUM_FRAMES, (unsigned)sampleOffset,
          (unsigned)sampleLatency, (unsigned)fPollMs);
     return true;
 }
@@ -143,6 +153,8 @@ bool QemuHDAAudioEngine::initHardware(IOService *provider)
 bool QemuHDAAudioEngine::createControls()
 {
     IOAudioControl *control;
+    const UInt32 usage = (fDir == kQemuHDAOutput) ? kIOAudioControlUsageOutput
+                                                  : kIOAudioControlUsageInput;
 
     control = IOAudioLevelControl::createVolumeControl(
         QHDA_VOLUME_MAX,            /* initial */
@@ -153,7 +165,7 @@ bool QemuHDAAudioEngine::createControls()
         kIOAudioControlChannelIDAll,
         kIOAudioControlChannelNameAll,
         0,
-        kIOAudioControlUsageOutput);
+        usage);
     if (!control) {
         return false;
     }
@@ -166,7 +178,7 @@ bool QemuHDAAudioEngine::createControls()
         kIOAudioControlChannelIDAll,
         kIOAudioControlChannelNameAll,
         0,
-        kIOAudioControlUsageOutput);
+        usage);
     if (!control) {
         return false;
     }
@@ -199,14 +211,14 @@ void QemuHDAAudioEngine::stop(IOService *provider)
 IOReturn QemuHDAAudioEngine::startDMA()
 {
     /* A fresh DMA start begins at frame 0 of a silent ring. */
-    if (fOutStream) {
-        void *buf = fOutStream->getSampleBuffer();
-        if (buf) bzero(buf, fOutStream->getSampleBufferSize());
+    if (fStream) {
+        void *buf = fStream->getSampleBuffer();
+        if (buf) bzero(buf, fStream->getSampleBufferSize());
     }
 
-    IOReturn r = fDevice->startOutputStream();
+    IOReturn r = fDevice->startStream(fDir);
     if (r != kIOReturnSuccess) {
-        QLOG(0, "cannot start output stream: 0x%x", r);
+        QLOG(0, "cannot start %s stream: 0x%x", DIRNAME, r);
         return r;
     }
     fDMAActive   = true;
@@ -222,9 +234,19 @@ void QemuHDAAudioEngine::stopDMA()
     if (fTimer) {
         fTimer->cancelTimeout();
     }
-    fDevice->stopOutputStream();
+    fDevice->stopStream(fDir);
     fDMAActive   = false;
     fIdleErasing = false;
+}
+
+void QemuHDAAudioEngine::suspendForSleep()
+{
+    /* IOAudioFamily already stopped a running engine (pauseAudioEngine);
+     * what may be left is the output DMA kept running while idle. The next
+     * performAudioEngineStart() after wake starts a fresh DMA. */
+    if (fDMAActive) {
+        stopDMA();
+    }
 }
 
 IOReturn QemuHDAAudioEngine::performAudioEngineStart()
@@ -243,14 +265,14 @@ IOReturn QemuHDAAudioEngine::performAudioEngineStart()
      * the play head; clients add into it, so it must start out silent. The
      * ring itself is already silent behind the DMA (idle erase), and the
      * part ahead of it is the tail of the previous sound, still playing. */
-    if (fOutStream) {
-        void *buf = fOutStream->getMixBuffer();
-        if (buf) bzero(buf, fOutStream->getMixBufferSize());
+    if (fDir == kQemuHDAOutput && fStream) {
+        void *buf = fStream->getMixBuffer();
+        if (buf) bzero(buf, fStream->getMixBufferSize());
     }
 
     resetPositionTracking();
     fRunning = true;
-    QLOG(2, "engine started (%s DMA)", resumed ? "running" : "new");
+    QLOG(2, "%s engine started (%s DMA)", DIRNAME, resumed ? "running" : "new");
     return kIOReturnSuccess;
 }
 
@@ -258,23 +280,34 @@ IOReturn QemuHDAAudioEngine::performAudioEngineStop()
 {
     fRunning = false;
 
+    if (fDir == kQemuHDAInput) {
+        /* Input stops for real: a running capture stream keeps the host's
+         * microphone open (and its in-use indicator lit) for nothing. */
+        UInt32 pos = fDevice->readPositionBytes(fDir);
+        stopDMA();
+        if (fDevice->getDebugLevel() >= 2) {
+            logStats("input engine stopped", pos);
+        }
+        return kIOReturnSuccess;
+    }
+
     /* Keep the DMA running: what CoreAudio wrote ahead of the play head
      * (about the sample offset) still gets played, and the next start
      * finds a steady stream. Erase behind the DMA from here on. */
-    fIdleErasePos    = fDevice->readOutputPositionBytes();
+    fIdleErasePos    = fDevice->readPositionBytes(fDir);
     fIdleErasedBytes = 0;
     fIdleErasing     = true;
     clock_get_uptime(&fIdleSince);
 
     if (fDevice->getDebugLevel() >= 2) {
-        logStats("engine stopped", fIdleErasePos);
+        logStats("output engine stopped", fIdleErasePos);
     }
     return kIOReturnSuccess;
 }
 
 void QemuHDAAudioEngine::eraseSamples(UInt32 fromBytes, UInt32 toBytes)
 {
-    UInt8 *ring = fOutStream ? (UInt8 *)fOutStream->getSampleBuffer() : NULL;
+    UInt8 *ring = fStream ? (UInt8 *)fStream->getSampleBuffer() : NULL;
     if (!ring) {
         return;
     }
@@ -288,7 +321,7 @@ void QemuHDAAudioEngine::eraseSamples(UInt32 fromBytes, UInt32 toBytes)
 
 void QemuHDAAudioEngine::idlePoll()
 {
-    UInt32 pos = fDevice->readOutputPositionBytes();
+    UInt32 pos = fDevice->readPositionBytes(fDir);
 
     if (fIdleErasing) {
         UInt32 advanced = (pos + QHDA_BUFFER_BYTES - fIdleErasePos) % QHDA_BUFFER_BYTES;
@@ -315,7 +348,7 @@ void QemuHDAAudioEngine::idlePoll()
 
 UInt32 QemuHDAAudioEngine::getCurrentSampleFrame()
 {
-    return fDevice->readOutputPositionBytes() / QHDA_BYTES_PER_FRAME;
+    return fDevice->readPositionBytes(fDir) / QHDA_BYTES_PER_FRAME;
 }
 
 IOReturn QemuHDAAudioEngine::performFormatChange(IOAudioStream *audioStream,
@@ -323,14 +356,14 @@ IOReturn QemuHDAAudioEngine::performFormatChange(IOAudioStream *audioStream,
                                                  const IOAudioSampleRate *newSampleRate)
 {
     /* Only the sample rate can change (one sample format is published). */
-    if (!newSampleRate || newSampleRate->whole == fDevice->getOutputRate()) {
+    if (!newSampleRate || newSampleRate->whole == fDevice->getRate(fDir)) {
         return kIOReturnSuccess;
     }
     if (!QemuHDAAudioDevice::isSupportedRate(newSampleRate->whole)) {
         return kIOReturnUnsupported;
     }
 
-    QLOG(1, "sample rate change %u -> %u Hz", (unsigned)fDevice->getOutputRate(),
+    QLOG(1, "%s sample rate change %u -> %u Hz", DIRNAME, (unsigned)fDevice->getRate(fDir),
          (unsigned)newSampleRate->whole);
 
     /* The HDA stream format may only change while the stream is stopped.
@@ -338,11 +371,11 @@ IOReturn QemuHDAAudioEngine::performFormatChange(IOAudioStream *audioStream,
     if (fDMAActive) {
         stopDMA();
     }
-    fDevice->setOutputRate(newSampleRate->whole);
+    fDevice->setRate(fDir, newSampleRate->whole);
     if (fRunning) {
         IOReturn r = startDMA();
         if (r != kIOReturnSuccess) {
-            QLOG(0, "cannot restart output stream after rate change: 0x%x", r);
+            QLOG(0, "cannot restart %s stream after rate change: 0x%x", DIRNAME, r);
             fRunning = false;
             return r;
         }
@@ -354,8 +387,8 @@ IOReturn QemuHDAAudioEngine::performFormatChange(IOAudioStream *audioStream,
 void QemuHDAAudioEngine::resetPositionTracking()
 {
     UInt64 now;
-    UInt32 pos = fDevice->readOutputPositionBytes();
-    const UInt64 bytesPerSec = (UInt64)fDevice->getOutputRate() * QHDA_BYTES_PER_FRAME;
+    UInt32 pos = fDevice->readPositionBytes(fDir);
+    const UInt64 bytesPerSec = (UInt64)fDevice->getRate(fDir) * QHDA_BYTES_PER_FRAME;
 
     clock_get_uptime(&now);
     fLastPosBytes = pos;
@@ -405,9 +438,9 @@ void QemuHDAAudioEngine::pollPosition()
         fLatePolls++;
     }
 
-    UInt32 pos = fDevice->readOutputPositionBytes();
-    const UInt64 bytesPerSec = (UInt64)fDevice->getOutputRate() * QHDA_BYTES_PER_FRAME;
-    const UInt64 ringNs      = (UInt64)QHDA_NUM_FRAMES * 1000000000ULL / fDevice->getOutputRate();
+    UInt32 pos = fDevice->readPositionBytes(fDir);
+    const UInt64 bytesPerSec = (UInt64)fDevice->getRate(fDir) * QHDA_BYTES_PER_FRAME;
+    const UInt64 ringNs      = (UInt64)QHDA_NUM_FRAMES * 1000000000ULL / fDevice->getRate(fDir);
 
     /*
      * How many times did the DMA engine wrap since the last poll?
@@ -422,8 +455,8 @@ void QemuHDAAudioEngine::pollPosition()
         if (travelled > pos) {
             wraps = (UInt32)((travelled - pos + QHDA_BUFFER_BYTES / 2) / QHDA_BUFFER_BYTES);
         }
-        QLOG(1, "poll delayed %llu ms (> ring), assuming %u wrap(s)",
-             (unsigned long long)(gapNs / 1000000ULL), (unsigned)wraps);
+        QLOG(1, "%s poll delayed %llu ms (> ring), assuming %u wrap(s)",
+             DIRNAME, (unsigned long long)(gapNs / 1000000ULL), (unsigned)wraps);
     }
     if (pos < fLastPosBytes && wraps == 0) {
         wraps = 1;
@@ -446,7 +479,7 @@ void QemuHDAAudioEngine::pollPosition()
     fLastPosBytes = pos;
 
     if (fDevice->getDebugLevel() >= 2 && absToNs(now - fStatsStart) >= QHDA_STATS_PERIOD_NS) {
-        logStats("stats", pos);
+        logStats(fDir == kQemuHDAOutput ? "output stats" : "input stats", pos);
         fStatsStart   = now;
         fMaxPollGapNs = 0;
         fLatePolls    = 0;
@@ -467,7 +500,7 @@ void QemuHDAAudioEngine::resetClipStats()
 void QemuHDAAudioEngine::logStats(const char *what, UInt32 pos)
 {
     IOLog("QemuHDAAudio: %s: wraps %u, late polls %u, max poll gap %llu us, pos %u | "
-          "clips %u (silent %u), frames %llu, max clip %u, lead %u..%u\n",
+          "io %u (silent %u), frames %llu, max io %u, lead %u..%u\n",
           what, (unsigned)fWraps, (unsigned)fLatePolls,
           (unsigned long long)(fMaxPollGapNs / 1000), (unsigned)pos,
           (unsigned)fClipCalls, (unsigned)fClipSilent, (unsigned long long)fClipFrames,
@@ -515,7 +548,7 @@ IOReturn QemuHDAAudioEngine::clipOutputSamples(const void *mixBuf, void *sampleB
     bool silent = true;
 
     if (fDevice->getDebugLevel() >= 2) {
-        UInt32 dmaFrame = fDevice->readOutputPositionBytes() / QHDA_BYTES_PER_FRAME;
+        UInt32 dmaFrame = fDevice->readPositionBytes(fDir) / QHDA_BYTES_PER_FRAME;
         UInt32 lead = (firstSampleFrame + QHDA_NUM_FRAMES - dmaFrame) % QHDA_NUM_FRAMES;
         fClipCalls++;
         fClipFrames += numSampleFrames;
@@ -533,6 +566,46 @@ IOReturn QemuHDAAudioEngine::clipOutputSamples(const void *mixBuf, void *sampleB
             s = -1.0f;
         }
         out[i] = (SInt16)(s * 32767.0f);
+    }
+    if (silent && fDevice->getDebugLevel() >= 2) {
+        fClipSilent++;
+    }
+    return kIOReturnSuccess;
+}
+
+/* ---- Convert (SInt16 DMA ring -> float client buffer) ------------------- */
+
+IOReturn QemuHDAAudioEngine::convertInputSamples(const void *sampleBuf, void *destBuf,
+                                                 UInt32 firstSampleFrame, UInt32 numSampleFrames,
+                                                 const IOAudioStreamFormat *streamFormat,
+                                                 IOAudioStream *audioStream)
+{
+    const UInt32  ch    = streamFormat->fNumChannels;
+    const SInt16 *in    = (const SInt16 *)sampleBuf + (firstSampleFrame * ch);
+    float        *out   = (float *)destBuf;
+    const UInt32  count = numSampleFrames * ch;
+
+    SInt32 vol = fVolume;
+    if (vol < 0) vol = 0;
+    if (vol > QHDA_VOLUME_MAX) vol = QHDA_VOLUME_MAX;
+    const float gain = (fMuted ? 0.0f : kQemuHDAGainTable[vol]) / 32768.0f;
+    bool silent = true;
+
+    if (fDevice->getDebugLevel() >= 2) {
+        /* For input, "lead" is how far behind the DMA write position
+         * CoreAudio reads: ~sample offset when healthy. */
+        UInt32 dmaFrame = fDevice->readPositionBytes(fDir) / QHDA_BYTES_PER_FRAME;
+        UInt32 lead = (dmaFrame + QHDA_NUM_FRAMES - firstSampleFrame) % QHDA_NUM_FRAMES;
+        fClipCalls++;
+        fClipFrames += numSampleFrames;
+        if (numSampleFrames > fClipMaxFrames) fClipMaxFrames = numSampleFrames;
+        if (lead < fLeadMin) fLeadMin = lead;
+        if (lead > fLeadMax) fLeadMax = lead;
+    }
+
+    for (UInt32 i = 0; i < count; i++) {
+        if (in[i] != 0) silent = false;
+        out[i] = (float)in[i] * gain;
     }
     if (silent && fDevice->getDebugLevel() >= 2) {
         fClipSilent++;

@@ -67,6 +67,10 @@
 			     running (avoids QEMU's stream start-up at the start of every sound). -->
 			<key>QemuHDAIdleStopSec</key>
 			<integer>0</integer>
+			<!-- 1 = publish the codec's input (hda-duplex line-in, hda-micro
+			     microphone) as a "Line In" device; 0 = output only. -->
+			<key>QemuHDAInput</key>
+			<integer>1</integer>
 			<!-- 1 = accept a non-QEMU codec (testing only). -->
 			<key>QemuHDAAllowAnyCodec</key>
 			<integer>0</integer>

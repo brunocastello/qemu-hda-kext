@@ -21,6 +21,11 @@ OSDefineMetaClassAndStructors(QemuHDAAudioDevice, IOAudioDevice)
 #define HDA_REG_CORBCTL 0x4C
 #define HDA_REG_RIRBCTL 0x5C
 
+static const char *dirName(QemuHDADirection dir)
+{
+    return dir == kQemuHDAOutput ? "output" : "input";
+}
+
 /* ------------------------------------------------------------------------ */
 
 UInt32 QemuHDAAudioDevice::getUIntProperty(const char *key, UInt32 defaultValue,
@@ -41,8 +46,14 @@ bool QemuHDAAudioDevice::initHardware(IOService *provider)
     fDebugLevel = getUIntProperty("QemuHDADebug", 1, 0, 3);
     {
         UInt32 rate = getUIntProperty("QemuHDASampleRate", QHDA_DEFAULT_RATE, 0, 0xFFFFFFFF);
-        setOutputRate(isSupportedRate(rate) ? rate : QHDA_DEFAULT_RATE);
+        if (!isSupportedRate(rate)) {
+            rate = QHDA_DEFAULT_RATE;
+        }
+        setRate(kQemuHDAOutput, rate);
+        setRate(kQemuHDAInput, rate);
     }
+    fStream[kQemuHDAOutput].tag = QHDA_OUT_STREAM_TAG;
+    fStream[kQemuHDAInput].tag  = QHDA_IN_STREAM_TAG;
     QLOG(1, "initHardware (build " QHDA_VERSION_STRING ")");
 
     if (!super::initHardware(provider)) {
@@ -71,9 +82,16 @@ bool QemuHDAAudioDevice::initHardware(IOService *provider)
 
     if (!initController())    return false;
     if (!discoverCodec())     return false;
-    if (!allocateDMABuffers()) return false;
+    if (!allocateDMABuffers(kQemuHDAOutput)) return false;
+    if (fStream[kQemuHDAInput].present && !allocateDMABuffers(kQemuHDAInput)) {
+        QLOG(0, "input disabled: cannot allocate its DMA buffers");
+        fStream[kQemuHDAInput].present = false;
+    }
     if (!configureCodec())    return false;
-    if (!resetOutputStream()) return false;
+    if (!resetStream(kQemuHDAOutput)) return false;
+    if (fStream[kQemuHDAInput].present && !resetStream(kQemuHDAInput)) {
+        fStream[kQemuHDAInput].present = false;
+    }
 
     setDeviceName("QEMU HDA Audio");
     setDeviceShortName("QEMUHDA");
@@ -81,22 +99,37 @@ bool QemuHDAAudioDevice::initHardware(IOService *provider)
     setDeviceModelName("QemuHDAAudio");
     setDeviceTransportType(kIOAudioDeviceTransportTypePCI);
 
-    if (!createEngine()) {
+    if (!createEngine(kQemuHDAOutput)) {
         return false;
     }
+    if (fStream[kQemuHDAInput].present && !createEngine(kQemuHDAInput)) {
+        QLOG(0, "input disabled: cannot create its engine");
+        fStream[kQemuHDAInput].present = false;
+    }
 
-    QLOG(1, "ready: codec cad=%u vendor=0x%08x afg=%u dac=%u pin=%u ampSteps=%u rate=%u",
+    QLOG(1, "ready: codec cad=%u vendor=0x%08x afg=%u dac=%u pin=%u ampSteps=%u rate=%u; "
+         "input: %s (adc=%u pin=%u ampSteps=%u)",
          (unsigned)fCodecAddr, (unsigned)fCodecVendor, (unsigned)fAFG,
-         (unsigned)fDAC, (unsigned)fPin, (unsigned)fDACAmpSteps, (unsigned)fRate);
+         (unsigned)fStream[kQemuHDAOutput].converter, (unsigned)fStream[kQemuHDAOutput].pin,
+         (unsigned)fStream[kQemuHDAOutput].ampSteps, (unsigned)fStream[kQemuHDAOutput].rate,
+         fStream[kQemuHDAInput].present ? "yes" : "no",
+         (unsigned)fStream[kQemuHDAInput].converter, (unsigned)fStream[kQemuHDAInput].pin,
+         (unsigned)fStream[kQemuHDAInput].ampSteps);
     return true;
 }
 
 void QemuHDAAudioDevice::stop(IOService *provider)
 {
     QLOG(1, "stop");
-    if (fRegs && fStreamRunning) {
-        stopOutputStream();
+    if (fRegs) {
+        for (int d = 0; d < kQemuHDANumDirections; d++) {
+            if (fStream[d].running) {
+                stopStream((QemuHDADirection)d);
+            }
+        }
     }
+    fEngine[kQemuHDAOutput] = NULL;
+    fEngine[kQemuHDAInput]  = NULL;
     super::stop(provider);
 }
 
@@ -109,6 +142,66 @@ void QemuHDAAudioDevice::free()
         fRegs = NULL;
     }
     super::free();
+}
+
+/* ---- Power management ----------------------------------------------------
+ * IOAudioFamily pauses running engines before calling us for sleep and
+ * resumes them after we return from wake. On S3 resume QEMU resets every
+ * device, so the controller, the codec and the stream descriptors must be
+ * programmed again; the DMA buffers live in RAM and survive.
+ */
+
+IOReturn QemuHDAAudioDevice::performPowerStateChange(IOAudioDevicePowerState oldPowerState,
+                                                     IOAudioDevicePowerState newPowerState,
+                                                     UInt32 *microsecondsUntilComplete)
+{
+    if (newPowerState == kIOAudioDeviceSleep && oldPowerState != kIOAudioDeviceSleep) {
+        QLOG(1, "going to sleep");
+        for (int d = 0; d < kQemuHDANumDirections; d++) {
+            if (fEngine[d]) {
+                fEngine[d]->suspendForSleep();      /* stops a DMA left running while idle */
+            }
+            if (fRegs && fStream[d].running) {
+                stopStream((QemuHDADirection)d);
+            }
+        }
+    } else if (oldPowerState == kIOAudioDeviceSleep && newPowerState != kIOAudioDeviceSleep) {
+        QLOG(1, "waking up");
+        if (!reinitAfterWake()) {
+            QLOG(0, "re-initialisation after wake failed; audio may stay silent");
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+bool QemuHDAAudioDevice::reinitAfterWake()
+{
+    if (!fRegs || !fPCI) {
+        return false;
+    }
+    fPCI->setMemoryEnable(true);
+    fPCI->setBusMasterEnable(true);
+
+    if (!initController()) {
+        return false;
+    }
+    /* Same codec, same nodes: only check it is still answering. */
+    UInt32 vendor = getParam(0, HDA_PAR_VENDOR_ID);
+    if (vendor != fCodecVendor) {
+        QLOG(0, "codec at cad %u answered 0x%08x after wake (expected 0x%08x)",
+             (unsigned)fCodecAddr, (unsigned)vendor, (unsigned)fCodecVendor);
+        return false;
+    }
+    if (!configureCodec()) {
+        return false;
+    }
+    for (int d = 0; d < kQemuHDANumDirections; d++) {
+        fStream[d].running = false;
+        if (fStream[d].present && !resetStream((QemuHDADirection)d)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* ---- Controller --------------------------------------------------------- */
@@ -127,7 +220,12 @@ bool QemuHDAAudioDevice::initController()
         QLOG(0, "controller reports no output streams (GCAP=0x%04x)", gcap);
         return false;
     }
-    fOutSDBase = HDA_SD_BASE + iss * HDA_SD_SIZE;
+    /* Input stream descriptors come first, then the output ones. */
+    fStream[kQemuHDAOutput].sdBase = HDA_SD_BASE + iss * HDA_SD_SIZE;
+    fStream[kQemuHDAInput].sdBase  = HDA_SD_BASE;
+    if (iss == 0) {
+        fStream[kQemuHDAInput].present = false;
+    }
 
     UInt32 gctl = rd32(HDA_REG_GCTL);
     if (!(gctl & HDA_GCTL_CRST)) {
@@ -220,6 +318,8 @@ bool QemuHDAAudioDevice::discoverCodec()
     UInt16 statests = rd16(HDA_REG_STATESTS);
     UInt32 candidates = statests & 0x7FFF;
     bool   allowAny = getUIntProperty("QemuHDAAllowAnyCodec", 0, 0, 1) != 0;
+    StreamState *out = &fStream[kQemuHDAOutput];
+    StreamState *in  = &fStream[kQemuHDAInput];
 
     QLOG(2, "STATESTS=0x%04x", statests);
     if (candidates == 0) {
@@ -260,142 +360,185 @@ bool QemuHDAAudioDevice::discoverCodec()
         return false;
     }
 
-    /* Find the first DAC and the first output-capable pin. */
+    /* Find the first DAC, ADC, output-capable pin and input-capable pin. */
     nc    = getParam(fAFG, HDA_PAR_NODE_COUNT);
     start = (nc >> 16) & 0xFF;
     count = nc & 0xFF;
-    fDAC = fPin = 0;
-    fDACAmpSteps = 0;
+    out->converter = out->pin = out->ampSteps = 0;
+    in->converter  = in->pin  = in->ampSteps  = 0;
     for (UInt32 nid = start; nid < start + count; nid++) {
         UInt32 cap  = getParam(nid, HDA_PAR_AUDIO_WIDGET_CAP);
         UInt32 type = HDA_WCAP_TYPE(cap);
         QLOG(2, "widget %u: caps 0x%08x type %u", (unsigned)nid, (unsigned)cap, (unsigned)type);
-        if (type == HDA_WID_AUD_OUT && !fDAC) {
-            fDAC = nid;
+        if (type == HDA_WID_AUD_OUT && !out->converter) {
+            out->converter = nid;
             if (cap & HDA_WCAP_OUT_AMP) {
-                fDACAmpSteps = HDA_AMPCAP_NUM_STEPS(getParam(nid, HDA_PAR_AMP_OUT_CAP));
+                out->ampSteps = HDA_AMPCAP_NUM_STEPS(getParam(nid, HDA_PAR_AMP_OUT_CAP));
             }
-        } else if (type == HDA_WID_PIN && !fPin) {
-            if (getParam(nid, HDA_PAR_PIN_CAP) & HDA_PINCAP_OUT) {
-                fPin = nid;
+        } else if (type == HDA_WID_AUD_IN && !in->converter) {
+            in->converter = nid;
+            if (cap & HDA_WCAP_IN_AMP) {
+                in->ampSteps = HDA_AMPCAP_NUM_STEPS(getParam(nid, HDA_PAR_AMP_IN_CAP));
+            }
+        } else if (type == HDA_WID_PIN) {
+            UInt32 pincap = getParam(nid, HDA_PAR_PIN_CAP);
+            if ((pincap & HDA_PINCAP_OUT) && !out->pin) {
+                out->pin = nid;
+            } else if ((pincap & HDA_PINCAP_IN) && !in->pin) {
+                in->pin = nid;
             }
         }
     }
-    if (!fDAC || !fPin) {
+    if (!out->converter || !out->pin) {
         QLOG(0, "codec has no usable output path (dac=%u pin=%u)",
-             (unsigned)fDAC, (unsigned)fPin);
+             (unsigned)out->converter, (unsigned)out->pin);
         return false;
     }
+    out->present = true;
+
+    /* Input is optional: hda-duplex (line-in) and hda-micro (microphone)
+     * have it, hda-output does not. The controller must also have input
+     * stream descriptors (initController() clears 'present' otherwise). */
+    in->present = (in->converter != 0 && in->pin != 0 &&
+                   ((rd16(HDA_REG_GCAP) >> 8) & 0x0F) != 0 &&
+                   getUIntProperty("QemuHDAInput", 1, 0, 1) != 0);
     return true;
 }
 
 bool QemuHDAAudioDevice::configureCodec()
 {
+    StreamState *out = &fStream[kQemuHDAOutput];
+    StreamState *in  = &fStream[kQemuHDAInput];
     bool ok = true;
 
     ok &= codecCommand(fAFG, HDA_VERB_SET_POWER_STATE, 0, NULL);   /* D0 */
-    ok &= codecCommand(fDAC, HDA_VERB_SET_POWER_STATE, 0, NULL);
-    ok &= codecCommand(fPin, HDA_VERB_SET_POWER_STATE, 0, NULL);
-    ok &= codecCommand(fPin, HDA_VERB_SET_PIN_WIDGET_CONTROL, HDA_PINCTL_OUT_EN, NULL);
+    ok &= codecCommand(out->converter, HDA_VERB_SET_POWER_STATE, 0, NULL);
+    ok &= codecCommand(out->pin, HDA_VERB_SET_POWER_STATE, 0, NULL);
+    ok &= codecCommand(out->pin, HDA_VERB_SET_PIN_WIDGET_CONTROL, HDA_PINCTL_OUT_EN, NULL);
 
-    if (fDACAmpSteps) {
+    if (out->ampSteps) {
         /* Hardware amp at its maximum (0 dB in QEMU's mixer); the volume
          * control is applied in software, in clipOutputSamples(). */
-        ok &= codecCommand4(fDAC, HDA_VERB_SET_AMP_GAIN_MUTE,
+        ok &= codecCommand4(out->converter, HDA_VERB_SET_AMP_GAIN_MUTE,
                             HDA_AMP_SET_OUTPUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT |
-                            (fDACAmpSteps & 0x7F), NULL);
+                            (out->ampSteps & 0x7F), NULL);
     }
 
-    ok &= codecCommand(fDAC, HDA_VERB_SET_CHANNEL_STREAMID, (QHDA_STREAM_TAG << 4) | 0, NULL);
-    ok &= codecCommand4(fDAC, HDA_VERB_SET_STREAM_FORMAT, fFormatWord, NULL);
+    ok &= codecCommand(out->converter, HDA_VERB_SET_CHANNEL_STREAMID, (out->tag << 4) | 0, NULL);
+    ok &= codecCommand4(out->converter, HDA_VERB_SET_STREAM_FORMAT, out->formatWord, NULL);
 
     if (!ok) {
         QLOG(0, "codec configuration failed");
+        return false;
     }
-    return ok;
+
+    if (in->present) {
+        bool inOk = true;
+        inOk &= codecCommand(in->converter, HDA_VERB_SET_POWER_STATE, 0, NULL);
+        inOk &= codecCommand(in->pin, HDA_VERB_SET_POWER_STATE, 0, NULL);
+        inOk &= codecCommand(in->pin, HDA_VERB_SET_PIN_WIDGET_CONTROL, HDA_PINCTL_IN_EN, NULL);
+        if (in->ampSteps) {
+            /* Same idea as the output: ADC amp at maximum, unmuted; the
+             * input level control is applied in convertInputSamples(). */
+            inOk &= codecCommand4(in->converter, HDA_VERB_SET_AMP_GAIN_MUTE,
+                                  HDA_AMP_SET_INPUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT |
+                                  (in->ampSteps & 0x7F), NULL);
+        }
+        inOk &= codecCommand(in->converter, HDA_VERB_SET_CHANNEL_STREAMID, (in->tag << 4) | 0, NULL);
+        inOk &= codecCommand4(in->converter, HDA_VERB_SET_STREAM_FORMAT, in->formatWord, NULL);
+        if (!inOk) {
+            QLOG(0, "input path configuration failed; input disabled");
+            in->present = false;
+        }
+    }
+    return true;
 }
 
 /* ---- DMA buffers -------------------------------------------------------- */
 
-bool QemuHDAAudioDevice::allocateDMABuffers()
+bool QemuHDAAudioDevice::allocateDMABuffers(QemuHDADirection dir)
 {
     /* 32-bit, page aligned, physically contiguous. */
     const mach_vm_address_t mask = 0x00000000FFFFF000ULL;
+    StreamState *st = &fStream[dir];
     IOByteCount segLen = 0;
 
-    fRingDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+    st->ringDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
         QHDA_BUFFER_BYTES, mask);
-    fBDLDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+    st->bdlDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
         PAGE_SIZE, mask);
-    if (!fRingDesc || !fBDLDesc) {
-        QLOG(0, "cannot allocate DMA buffers");
+    if (!st->ringDesc || !st->bdlDesc) {
+        QLOG(0, "cannot allocate %s DMA buffers", dirName(dir));
         return false;
     }
-    if (fRingDesc->prepare() != kIOReturnSuccess || fBDLDesc->prepare() != kIOReturnSuccess) {
-        QLOG(0, "cannot wire DMA buffers");
-        return false;
-    }
-
-    fRingVirt = fRingDesc->getBytesNoCopy();
-    fBDLVirt  = fBDLDesc->getBytesNoCopy();
-    bzero(fRingVirt, QHDA_BUFFER_BYTES);
-    bzero(fBDLVirt, PAGE_SIZE);
-
-    fRingPhys = fRingDesc->getPhysicalSegment(0, &segLen, kIOMemoryMapperNone);
-    if (!fRingPhys || segLen < QHDA_BUFFER_BYTES) {
-        QLOG(0, "ring buffer not contiguous (phys 0x%llx len %llu)",
-             (unsigned long long)fRingPhys, (unsigned long long)segLen);
-        return false;
-    }
-    fBDLPhys = fBDLDesc->getPhysicalSegment(0, &segLen, kIOMemoryMapperNone);
-    if (!fBDLPhys) {
-        QLOG(0, "BDL has no physical address");
+    if (st->ringDesc->prepare() != kIOReturnSuccess || st->bdlDesc->prepare() != kIOReturnSuccess) {
+        QLOG(0, "cannot wire %s DMA buffers", dirName(dir));
         return false;
     }
 
-    QemuHDABDLEntry *bdl = (QemuHDABDLEntry *)fBDLVirt;
+    st->ringVirt = st->ringDesc->getBytesNoCopy();
+    st->bdlVirt  = st->bdlDesc->getBytesNoCopy();
+    bzero(st->ringVirt, QHDA_BUFFER_BYTES);
+    bzero(st->bdlVirt, PAGE_SIZE);
+
+    st->ringPhys = st->ringDesc->getPhysicalSegment(0, &segLen, kIOMemoryMapperNone);
+    if (!st->ringPhys || segLen < QHDA_BUFFER_BYTES) {
+        QLOG(0, "%s ring buffer not contiguous (phys 0x%llx len %llu)", dirName(dir),
+             (unsigned long long)st->ringPhys, (unsigned long long)segLen);
+        return false;
+    }
+    st->bdlPhys = st->bdlDesc->getPhysicalSegment(0, &segLen, kIOMemoryMapperNone);
+    if (!st->bdlPhys) {
+        QLOG(0, "%s BDL has no physical address", dirName(dir));
+        return false;
+    }
+
+    QemuHDABDLEntry *bdl = (QemuHDABDLEntry *)st->bdlVirt;
     const UInt32 chunk = QHDA_BUFFER_BYTES / QHDA_BDL_ENTRIES;
     for (UInt32 i = 0; i < QHDA_BDL_ENTRIES; i++) {
-        UInt64 a = fRingPhys + (UInt64)i * chunk;
+        UInt64 a = st->ringPhys + (UInt64)i * chunk;
         bdl[i].addrLow  = OSSwapHostToLittleInt32((UInt32)(a & 0xFFFFFFFFULL));
         bdl[i].addrHigh = OSSwapHostToLittleInt32((UInt32)(a >> 32));
         bdl[i].length   = OSSwapHostToLittleInt32(chunk);
         bdl[i].flags    = 0;    /* no IOC: we poll, interrupts stay off */
     }
 
-    QLOG(2, "ring phys 0x%llx (%u bytes), BDL phys 0x%llx",
-         (unsigned long long)fRingPhys, (unsigned)QHDA_BUFFER_BYTES,
-         (unsigned long long)fBDLPhys);
+    QLOG(2, "%s ring phys 0x%llx (%u bytes), BDL phys 0x%llx", dirName(dir),
+         (unsigned long long)st->ringPhys, (unsigned)QHDA_BUFFER_BYTES,
+         (unsigned long long)st->bdlPhys);
     return true;
 }
 
 void QemuHDAAudioDevice::freeDMABuffers()
 {
-    if (fRingDesc) {
-        fRingDesc->complete();
-        fRingDesc->release();
-        fRingDesc = NULL;
-        fRingVirt = NULL;
-    }
-    if (fBDLDesc) {
-        fBDLDesc->complete();
-        fBDLDesc->release();
-        fBDLDesc = NULL;
-        fBDLVirt = NULL;
+    for (int d = 0; d < kQemuHDANumDirections; d++) {
+        StreamState *st = &fStream[d];
+        if (st->ringDesc) {
+            st->ringDesc->complete();
+            st->ringDesc->release();
+            st->ringDesc = NULL;
+            st->ringVirt = NULL;
+        }
+        if (st->bdlDesc) {
+            st->bdlDesc->complete();
+            st->bdlDesc->release();
+            st->bdlDesc = NULL;
+            st->bdlVirt = NULL;
+        }
     }
 }
 
-/* ---- Output stream ------------------------------------------------------ */
+/* ---- Streams ------------------------------------------------------------ */
 
-bool QemuHDAAudioDevice::resetOutputStream()
+bool QemuHDAAudioDevice::resetStream(QemuHDADirection dir)
 {
-    const UInt32 sd = fOutSDBase;
+    const UInt32 sd = fStream[dir].sdBase;
     int i;
 
     /* Stop DMA first. */
-    wr32(sd + HDA_SD_CTL, rd32(sd + HDA_SD_CTL) & ~(HDA_SD_CTL_RUN | HDA_SD_STS_MASK));
+    wr32(sd + HDA_SD_CTL, rd32(sd + HDA_SD_CTL) & ~(UInt32)(HDA_SD_CTL_RUN | HDA_SD_STS_MASK));
     for (i = 0; i < 100 && (rd32(sd + HDA_SD_CTL) & HDA_SD_CTL_RUN); i++) {
         IODelay(10);
     }
@@ -409,91 +552,96 @@ bool QemuHDAAudioDevice::resetOutputStream()
         IODelay(10);
     }
     if (rd32(sd + HDA_SD_CTL) & HDA_SD_CTL_SRST) {
-        QLOG(0, "output stream stuck in reset");
+        QLOG(0, "%s stream stuck in reset", dirName(dir));
         return false;
     }
     return true;
 }
 
-IOReturn QemuHDAAudioDevice::startOutputStream()
+IOReturn QemuHDAAudioDevice::startStream(QemuHDADirection dir)
 {
-    const UInt32 sd = fOutSDBase;
+    StreamState *st = &fStream[dir];
+    const UInt32 sd = st->sdBase;
 
-    if (!fRegs) return kIOReturnNotReady;
-    if (fStreamRunning) return kIOReturnSuccess;
+    if (!fRegs || !st->present) return kIOReturnNotReady;
+    if (st->running) return kIOReturnSuccess;
 
-    if (!resetOutputStream()) {
+    if (!resetStream(dir)) {
         return kIOReturnIOError;
     }
 
-    wr32(sd + HDA_SD_BDPL, (UInt32)(fBDLPhys & 0xFFFFFFFFULL));
-    wr32(sd + HDA_SD_BDPU, (UInt32)(fBDLPhys >> 32));
+    wr32(sd + HDA_SD_BDPL, (UInt32)(st->bdlPhys & 0xFFFFFFFFULL));
+    wr32(sd + HDA_SD_BDPU, (UInt32)(st->bdlPhys >> 32));
     wr32(sd + HDA_SD_CBL, QHDA_BUFFER_BYTES);
     wr16(sd + HDA_SD_LVI, QHDA_BDL_ENTRIES - 1);
-    wr16(sd + HDA_SD_FMT, fFormatWord);
+    wr16(sd + HDA_SD_FMT, st->formatWord);
 
     /* Re-assert the codec side every time: cheap, and robust against a
      * codec reset while we were stopped. */
-    codecCommand(fDAC, HDA_VERB_SET_CHANNEL_STREAMID, (QHDA_STREAM_TAG << 4) | 0, NULL);
-    codecCommand4(fDAC, HDA_VERB_SET_STREAM_FORMAT, fFormatWord, NULL);
+    codecCommand(st->converter, HDA_VERB_SET_CHANNEL_STREAMID, (st->tag << 4) | 0, NULL);
+    codecCommand4(st->converter, HDA_VERB_SET_STREAM_FORMAT, st->formatWord, NULL);
 
-    UInt32 ctl = (UInt32)QHDA_STREAM_TAG << HDA_SD_CTL_STRM_SHIFT;
+    UInt32 ctl = st->tag << HDA_SD_CTL_STRM_SHIFT;
     wr32(sd + HDA_SD_CTL, ctl);
     wr32(sd + HDA_SD_CTL, ctl | HDA_SD_CTL_RUN);
 
-    fStreamRunning = true;
-    QLOG(2, "output stream started at %u Hz (SD @0x%x, FMT=0x%04x, CTL=0x%08x)",
-         (unsigned)fRate, (unsigned)sd, (unsigned)fFormatWord, (unsigned)rd32(sd + HDA_SD_CTL));
+    st->running = true;
+    QLOG(2, "%s stream started at %u Hz (SD @0x%x, FMT=0x%04x, CTL=0x%08x)", dirName(dir),
+         (unsigned)st->rate, (unsigned)sd, (unsigned)st->formatWord, (unsigned)rd32(sd + HDA_SD_CTL));
     return kIOReturnSuccess;
 }
 
-void QemuHDAAudioDevice::setOutputRate(UInt32 rate)
+void QemuHDAAudioDevice::setRate(QemuHDADirection dir, UInt32 rate)
 {
     /* Applied to the stream descriptor and the codec on the next
-     * startOutputStream(); the HDA spec requires the stream to be stopped
+     * startStream(); the HDA spec requires the stream to be stopped
      * while its format changes. */
-    fRate       = rate;
-    fFormatWord = (rate == 44100) ? HDA_FMT_44K1_16BIT_STEREO : HDA_FMT_48K_16BIT_STEREO;
-    QLOG(2, "output rate set to %u Hz (FMT=0x%04x)", (unsigned)fRate, (unsigned)fFormatWord);
+    StreamState *st = &fStream[dir];
+    st->rate       = rate;
+    st->formatWord = (rate == 44100) ? HDA_FMT_44K1_16BIT_STEREO : HDA_FMT_48K_16BIT_STEREO;
+    QLOG(2, "%s rate set to %u Hz (FMT=0x%04x)", dirName(dir), (unsigned)rate,
+         (unsigned)st->formatWord);
 }
 
-void QemuHDAAudioDevice::stopOutputStream()
+void QemuHDAAudioDevice::stopStream(QemuHDADirection dir)
 {
-    const UInt32 sd = fOutSDBase;
+    const UInt32 sd = fStream[dir].sdBase;
 
     if (!fRegs) return;
-    wr32(sd + HDA_SD_CTL, rd32(sd + HDA_SD_CTL) & ~(HDA_SD_CTL_RUN | HDA_SD_STS_MASK));
-    fStreamRunning = false;
-    QLOG(2, "output stream stopped");
+    wr32(sd + HDA_SD_CTL, rd32(sd + HDA_SD_CTL) & ~(UInt32)(HDA_SD_CTL_RUN | HDA_SD_STS_MASK));
+    fStream[dir].running = false;
+    QLOG(2, "%s stream stopped", dirName(dir));
 }
 
-UInt32 QemuHDAAudioDevice::readOutputPositionBytes()
+UInt32 QemuHDAAudioDevice::readPositionBytes(QemuHDADirection dir)
 {
     if (!fRegs) return 0;
-    UInt32 pos = rd32(fOutSDBase + HDA_SD_LPIB);
+    UInt32 pos = rd32(fStream[dir].sdBase + HDA_SD_LPIB);
     if (pos >= QHDA_BUFFER_BYTES) {
         pos %= QHDA_BUFFER_BYTES;
     }
     return pos & ~(UInt32)(QHDA_BYTES_PER_FRAME - 1);
 }
 
-/* ---- Engine ------------------------------------------------------------- */
+/* ---- Engines ------------------------------------------------------------ */
 
-bool QemuHDAAudioDevice::createEngine()
+bool QemuHDAAudioDevice::createEngine(QemuHDADirection dir)
 {
     QemuHDAAudioEngine *engine = new QemuHDAAudioEngine;
     if (!engine) {
         return false;
     }
-    if (!engine->init(this)) {
+    if (!engine->init(this, dir)) {
         engine->release();
         return false;
     }
     IOReturn r = activateAudioEngine(engine);
-    engine->release();
     if (r != kIOReturnSuccess) {
-        QLOG(0, "activateAudioEngine failed: 0x%x", r);
+        engine->release();
+        QLOG(0, "activateAudioEngine (%s) failed: 0x%x", dirName(dir), r);
         return false;
     }
+    fEngine[dir] = engine;      /* the device's engine list holds the reference */
+    engine->release();
     return true;
 }

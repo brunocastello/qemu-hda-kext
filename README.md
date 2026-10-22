@@ -8,7 +8,7 @@ It targets guests running under **x86 emulation (TCG)**, for example on an Apple
 - a large, adjustable sample offset;
 - timestamps derived from the DMA position (LPIB), with no interrupts.
 
-Output is 16-bit stereo at **44.1 kHz** (default) or 48 kHz. x86_64 only: the guest must run the 64-bit kernel (`uname -m` → `x86_64`).
+Output (and input, with `hda-duplex` or `hda-micro`) is 16-bit stereo at **44.1 kHz** (default) or 48 kHz. Sleep/wake is supported. x86_64 only: the guest must run the 64-bit kernel (`uname -m` → `x86_64`).
 
 Tested: Mac OS X 10.6.8 on UTM (QEMU 10.0, TCG) on an M4 Pro Mac — system sounds, `say`, QuickTime and iTunes play cleanly. 10.7–10.9 are untested.
 
@@ -63,6 +63,17 @@ hda-output,bus=hda0.0,audiodev=snd0
 
 `intel-hda` (ICH6) also works instead of `ich9-intel-hda`. Uninstall VoodooHDA first.
 
+### Audio input
+
+Use `hda-duplex` (line out + line in) or `hda-micro` (speaker + microphone) instead of `hda-output`; the same `-audiodev` serves both directions:
+
+```
+-device
+hda-duplex,bus=hda0.0,audiodev=snd0
+```
+
+The guest then shows **QEMU HDA Audio** under *System Preferences → Sound → Input* ("Line In"). On the host, UTM needs microphone access (macOS asks the first time; otherwise *System Settings → Privacy & Security → Microphone*). The input stream only runs while a guest app records, so the host microphone is not held open otherwise. Set `QemuHDAInput` to 0 to hide the input.
+
 ### Sample rate
 
 QEMU opens the host's CoreAudio output at **44100 Hz** by default, and the kext defaults to 44100 Hz too, so nothing is resampled.
@@ -111,6 +122,7 @@ Settings live in the installed kext's `Info.plist`:
 | `QemuHDASampleOffset` | 4096 | frames CoreAudio writes ahead of the DMA (~93 ms). Raise to 8192 if audio still stutters |
 | `QemuHDASampleRate` | 44100 | initial rate (44100 or 48000); match the `-audiodev` frequency |
 | `QemuHDAIdleStopSec` | 0 | seconds of silence before the DMA stops; 0 = keep it running (avoids losing the start of short sounds) |
+| `QemuHDAInput` | 1 | publish the codec's input (hda-duplex / hda-micro); 0 = output only |
 | `QemuHDAPollIntervalMs` | 5 | LPIB polling interval |
 | `QemuHDASampleLatency` | 32 | reported latency (A/V sync only) |
 

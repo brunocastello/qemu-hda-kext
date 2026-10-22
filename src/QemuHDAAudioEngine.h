@@ -1,6 +1,8 @@
 /*
  * QemuHDAAudioEngine.h
- * IOAudioEngine with a single 16-bit stereo output stream.
+ * IOAudioEngine with a single 16-bit stereo stream, output or input; the
+ * device creates one engine per direction, each timed by its own DMA
+ * position (QEMU paces output and input independently).
  *
  * Rates: 44.1 kHz (default) and 48 kHz, selectable in Audio MIDI Setup.
  *
@@ -22,14 +24,14 @@
 #include <IOKit/audio/IOAudioEngine.h>
 #include <IOKit/IOTimerEventSource.h>
 
-class QemuHDAAudioDevice;
+#include "QemuHDAAudioDevice.h"
 
 class QemuHDAAudioEngine : public IOAudioEngine
 {
     OSDeclareDefaultStructors(QemuHDAAudioEngine)
 
 public:
-    virtual bool init(QemuHDAAudioDevice *device);
+    virtual bool init(QemuHDAAudioDevice *device, QemuHDADirection dir);
     virtual void free();
 
     virtual bool initHardware(IOService *provider);
@@ -47,6 +49,13 @@ public:
                                        UInt32 firstSampleFrame, UInt32 numSampleFrames,
                                        const IOAudioStreamFormat *streamFormat,
                                        IOAudioStream *audioStream);
+    virtual IOReturn convertInputSamples(const void *sampleBuf, void *destBuf,
+                                         UInt32 firstSampleFrame, UInt32 numSampleFrames,
+                                         const IOAudioStreamFormat *streamFormat,
+                                         IOAudioStream *audioStream);
+
+    /* Called by the device before system sleep (on its work loop). */
+    void suspendForSleep();
 
     /* Control handlers (static trampolines). */
     static IOReturn volumeChangeHandler(OSObject *target, IOAudioControl *control,
@@ -68,16 +77,18 @@ private:
 
     QemuHDAAudioDevice  *fDevice;
     IOTimerEventSource  *fTimer;
-    IOAudioStream       *fOutStream;
+    IOAudioStream       *fStream;
+    QemuHDADirection     fDir;
 
     UInt32               fPollMs;
     UInt32               fLastPosBytes;
     bool                 fRunning;      /* IOAudioEngine started (clients active) */
 
-    /* The DMA keeps running (playing silence) between engine stop and the
-     * next start, so a start does not pay QEMU's stream start-up and the
-     * first timestamp comes from an already steady LPIB. While idle, the
-     * poll timer erases the ring behind the DMA position. */
+    /* Output only: the DMA keeps running (playing silence) between engine
+     * stop and the next start, so a start does not pay QEMU's stream
+     * start-up and the first timestamp comes from an already steady LPIB.
+     * While idle, the poll timer erases the ring behind the DMA position.
+     * The input DMA is stopped with the engine. */
     bool                 fDMAActive;
     bool                 fIdleErasing;
     UInt32               fIdleErasePos;     /* bytes */
@@ -95,10 +106,12 @@ private:
     UInt32               fWraps;
     UInt32               fLatePolls;
 
-    /* clip statistics (debug level >= 2), reset every stats period.
-     * "lead" = frames between the DMA read position and the first frame
-     * CoreAudio clips, modulo the ring: ~sample offset when healthy, close
-     * to the ring size when CoreAudio writes behind the DMA (too late). */
+    /* clip/convert statistics (debug level >= 2), reset every stats period.
+     * Output: "lead" = frames between the DMA read position and the first
+     * frame CoreAudio clips, modulo the ring: ~sample offset when healthy,
+     * close to the ring size when CoreAudio writes behind the DMA (too
+     * late). Input: frames between the first frame CoreAudio reads and the
+     * DMA write position. */
     UInt32               fClipCalls;
     UInt32               fClipSilent;   /* calls whose mix data was all zero */
     UInt64               fClipFrames;

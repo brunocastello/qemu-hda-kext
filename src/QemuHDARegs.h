@@ -84,22 +84,28 @@ struct QemuHDABDLEntry {
 #define HDA_PAR_AUDIO_WIDGET_CAP    0x09
 #define HDA_PAR_PCM                 0x0A
 #define HDA_PAR_PIN_CAP             0x0C
+#define HDA_PAR_AMP_IN_CAP          0x0D
 #define HDA_PAR_AMP_OUT_CAP         0x12
 
 #define HDA_FUNC_TYPE_AUDIO         0x01
 
 #define HDA_WCAP_TYPE(cap)          (((cap) >> 20) & 0x0F)
 #define HDA_WID_AUD_OUT             0x0
+#define HDA_WID_AUD_IN              0x1
 #define HDA_WID_PIN                 0x4
+#define HDA_WCAP_IN_AMP             (1u << 1)
 #define HDA_WCAP_OUT_AMP            (1u << 2)
 
 #define HDA_PINCAP_OUT              (1u << 4)
+#define HDA_PINCAP_IN               (1u << 5)
+#define HDA_PINCTL_IN_EN            0x20
 #define HDA_PINCTL_OUT_EN           0x40
 
 #define HDA_AMPCAP_NUM_STEPS(cap)   (((cap) >> 8) & 0x7F)
 
 /* SET_AMP_GAIN_MUTE payload bits */
 #define HDA_AMP_SET_OUTPUT          0x8000
+#define HDA_AMP_SET_INPUT           0x4000
 #define HDA_AMP_SET_LEFT            0x2000
 #define HDA_AMP_SET_RIGHT           0x1000
 #define HDA_AMP_MUTE                0x0080

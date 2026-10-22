@@ -28,9 +28,11 @@ Driver de áudio (kext IOAudioFamily) para o controlador Intel HDA emulado pelo 
 ```
 src/
   QemuHDAAudioDevice.{h,cpp}  IOAudioDevice: PCI/BAR0, reset do controlador, descoberta do codec,
-                              buffers DMA (ring 64 KiB + BDL), start/stop do stream, leitura do LPIB.
-  QemuHDAAudioEngine.{h,cpp}  IOAudioEngine: 1 stream de saída 16 bit/estéreo (44,1 ou 48 kHz), controles de
-                              volume/mute (software), clip float→SInt16, timer que faz polling do LPIB.
+                              buffers DMA por direção (ring 64 KiB + BDL), start/stop dos streams,
+                              leitura do LPIB, sleep/wake (performPowerStateChange).
+  QemuHDAAudioEngine.{h,cpp}  IOAudioEngine (um por direção): 1 stream 16 bit/estéreo (44,1 ou 48 kHz),
+                              volume/mute em software, clip float→SInt16 (saída) / convert SInt16→float
+                              (entrada), timer que faz polling do LPIB; DMA de saída contínuo entre sons.
   QemuHDARegs.h               registradores HDA e verbos de codec usados.
   QemuHDAGainTable.h          curva de volume pré-calculada (0,75 dB/passo) — sem pow() no kernel.
   kmod_info.c                 equivalente ao <produto>_info.c que o Xcode gera para kexts.
@@ -114,6 +116,7 @@ Logs: 10.6/10.7 em `/var/log/kernel.log`; 10.8/10.9 em `/var/log/system.log`. Pr
 | `QemuHDASampleLatency` | 32 | latência reportada (só sincronia A/V) |
 | `QemuHDAPollIntervalMs` | 5 | intervalo do polling do LPIB |
 | `QemuHDAIdleStopSec` | 0 | segundos de silêncio até parar o DMA; 0 = DMA sempre rodando entre sons (evita perder o começo de sons curtos) |
+| `QemuHDAInput` | 1 | publicar a entrada do codec (hda-duplex/hda-micro) como "Line In"; 0 = só saída |
 | `QemuHDAAllowAnyCodec` | 0 | aceitar codec não-QEMU (só teste) |
 
 Depois de editar: `sudo touch /System/Library/Extensions` e reiniciar (ou `sudo kextunload -b org.qemuhda.driver.QemuHDAAudio && sudo kextload …`).
@@ -150,7 +153,7 @@ Depois de editar: `sudo touch /System/Library/Extensions` e reiniciar (ou `sudo 
 
 - ~~Primeiro build no Actions~~ (ok). ~~10.6.8~~ (ok, com o relógio corrigido).
 - Testar 10.7, 10.8, 10.9 (mesmo binário; verificar `machdep.tsc.frequency` e se o limiar de TSC do commpage também existe).
-- Se ficar bom: gerenciamento de energia (sleep/wake), entrada (`hda-duplex`).
+- 0.3.0 (não testado no convidado ainda): **entrada** — engine separado por direção (cada um com relógio do próprio LPIB; o QEMU ritma entrada e saída independentemente). Entrada no SD0 (tag 2), saída no SD4 (tag 1); ADC/pino de entrada descobertos genericamente, amp do ADC no máximo, ganho em software em `convertInputSamples`. DMA de entrada **para** com o engine (senão o UTM segura o microfone do host). **Sleep/wake** — `performPowerStateChange`: no sleep para os DMAs (inclusive o de saída ocioso); no wake re-inicializa controlador/codec/streams (o QEMU reseta os dispositivos no resume de S3; o `-global ICH9-LPC.disable_s3=0` do usuário habilita S3). Testar: `hda-duplex` + gravação (QuickTime → Nova Gravação de Áudio), `pmset sleepnow` e acordar.
 
 ## Convenções
 
