@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>@EXECUTABLE@</string>
+	<key>CFBundleIdentifier</key>
+	<string>@BUNDLE_ID@</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>@EXECUTABLE@</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT License. Audio driver for QEMU's emulated Intel HDA controller.</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>QemuHDAAudio</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>@BUNDLE_ID@</string>
+			<key>IOClass</key>
+			<string>QemuHDAAudioDevice</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<!-- QEMU intel-hda (ICH6, 8086:2668) and ich9-intel-hda (8086:293e).
+			     Format is 0xDDDDVVVV (device id, vendor id). -->
+			<key>IOPCIMatch</key>
+			<string>0x26688086 0x293e8086</string>
+			<!-- Win over VoodooHDA / AppleHDA if they are installed too. -->
+			<key>IOProbeScore</key>
+			<integer>6000</integer>
+
+			<!-- Tunables. Edit, then: sudo touch /System/Library/Extensions && reboot
+			     (or reload the kext). -->
+
+			<!-- 0 = errors only, 1 = startup info, 2 = stream events + stats every 10 s,
+			     3 = every codec verb -->
+			<key>QemuHDADebug</key>
+			<integer>1</integer>
+			<!-- Initial sample rate: 44100 or 48000. Match QEMU's -audiodev
+			     out.frequency (QEMU's default is 44100) so QEMU does not have to
+			     resample. Can also be changed at runtime in Audio MIDI Setup. -->
+			<key>QemuHDASampleRate</key>
+			<integer>44100</integer>
+			<!-- How far ahead of the DMA position CoreAudio must write, in frames
+			     (~44-48 frames = 1 ms). Bigger = more tolerant of guest latency under
+			     QEMU TCG, but more output latency. Range 64..8192. -->
+			<key>QemuHDASampleOffset</key>
+			<integer>4096</integer>
+			<!-- Reported output latency in frames (A/V sync only). -->
+			<key>QemuHDASampleLatency</key>
+			<integer>32</integer>
+			<!-- LPIB polling interval for buffer-wrap timestamps, in ms (1..50). -->
+			<key>QemuHDAPollIntervalMs</key>
+			<integer>5</integer>
+			<!-- 1 = accept a non-QEMU codec (testing only). -->
+			<key>QemuHDAAllowAnyCodec</key>
+			<integer>0</integer>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOAudioFamily</key>
+		<string>1.1fc9</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>1.0.0b1</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>10.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>10.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>10.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>10.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>10.0</string>
+	</dict>
+</dict>
+</plist>
