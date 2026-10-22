@@ -73,7 +73,7 @@ Versão em `VERSION`. Pontos sensíveis das flags (não remova sem motivo):
 
 ### Situação do build (importante)
 
-O código **compila** (verificado com clang 18 no Linux, sem warnings, sem `__cxa_atexit`). O **link ainda não foi testado num Mac real** — o primeiro run do GitHub Actions é o teste. Se falhar no link:
+**Build verde no GitHub Actions** desde o 1º run (2026-10-22, commit `4d393b4`, `macos-15`, Xcode 16.4 / Apple clang 17): link com `-kext` ok sem `-ld_classic`, load commands só `LC_SEGMENT_64`/`LC_SYMTAB`/`LC_DYSYMTAB`/`LC_UUID`, sem `__cxa_atexit`. Restam 2 warnings `-Wsign-conversion` inofensivos em `QemuHDAAudioDevice.cpp` (`~(HDA_SD_CTL_RUN | HDA_SD_STS_MASK)`). O aviso `refs/tags/IOAudioFamily-183.4.11 ... is not a commit!` no `make deps` é só tag anotada em clone raso. **Ainda não testado no convidado.** Se um dia falhar no link:
 
 1. Leia o log do passo "Build". Suspeitos: o `ld` novo (ld-prime) com `-kext` e alvo 10.6; tente `-Xlinker -ld_classic` em `LDFLAGS` (se a versão do Xcode ainda tiver), ou fixe outra versão do Xcode no workflow (`sudo xcode-select -s /Applications/Xcode_XX.app`).
 2. `libclang_rt.cc_kext.a` é opcional; se faltar símbolo de builtin (`___udivti3` etc.), ache o caminho com `xcrun clang -print-file-name=lib/darwin/libclang_rt.cc_kext.a`.
@@ -127,7 +127,7 @@ Depois de editar: `sudo touch /System/Library/Extensions` e reiniciar (ou `sudo 
 
 ## Próximos passos
 
-- Primeiro build no Actions → corrigir link se preciso.
+- ~~Primeiro build no Actions~~ (ok).
 - Testar no 10.6.8; depois 10.7, 10.8, 10.9 (mesmo binário).
 - Se ficar bom: gerenciamento de energia (sleep/wake), entrada (`hda-duplex`).
 
