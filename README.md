@@ -1,28 +1,56 @@
 # QemuHDAAudio.kext
 
-Driver de áudio para Mac OS X **10.6 a 10.9** rodando no **QEMU/UTM**, feito para o controlador Intel HDA emulado (`intel-hda` / `ich9-intel-hda`) com o codec `hda-output`.
+Audio driver for **Mac OS X 10.6–10.9** guests on **QEMU/UTM**. It drives QEMU's emulated Intel HDA controller (`intel-hda` / `ich9-intel-hda`) with the `hda-output` codec.
 
-Foi pensado para convidados em **emulação x86 (TCG)**, por exemplo num Mac com Apple Silicon, onde o VoodooHDA e o `usb-audio` falham ou "martelam". Para absorver a latência irregular do convidado emulado, ele usa:
+It targets guests running under **x86 emulation (TCG)**, for example on an Apple Silicon Mac, where VoodooHDA stays silent and `usb-audio` stutters. To ride out the emulated guest's irregular latency it uses:
 
-- um buffer DMA grande, de cerca de 340 ms;
-- um *sample offset* grande e ajustável;
-- timestamps calculados a partir da posição do DMA, sem depender de interrupções.
+- a large DMA ring (~370 ms at 44.1 kHz) that keeps running between sounds;
+- a large, adjustable sample offset;
+- timestamps derived from the DMA position (LPIB), with no interrupts.
 
-Saída 16 bits estéreo em **44,1 kHz** (padrão) ou 48 kHz. Só x86_64: o convidado precisa estar com o kernel 64-bit (`uname -m` → `x86_64`).
+Output is 16-bit stereo at **44.1 kHz** (default) or 48 kHz. x86_64 only: the guest must run the 64-bit kernel (`uname -m` → `x86_64`).
 
-## Obter o kext
+Tested: Mac OS X 10.6.8 on UTM (QEMU 10.0, TCG) on an M4 Pro Mac — system sounds, `say`, QuickTime and iTunes play cleanly. 10.7–10.9 are untested.
 
-O GitHub Actions compila a cada push.
+## Required: fix the guest clock first (OpenCore)
 
-1. Abra a aba **Actions** do repositório, clique no último run do workflow `build` e baixe o artefato `QemuHDAAudio-…`.
-2. O artefato é um `.zip` que contém outro `QemuHDAAudio-<versão>.zip`, com o kext e os scripts.
-3. Em tags `v*` (por exemplo `v0.1.0`), o zip também é anexado a uma Release.
+**Without this, audio stops after ~2 seconds** (and most other timing in the guest is off too).
 
-O build roda no GitHub Actions (`make deps && make zip` num runner macOS).
+Under TCG on an ARM64 host, QEMU's emulated TSC ticks at exactly **1 GHz**. The guest kernel computes the TSC frequency from the `FSBFrequency` OpenCore hands it × the bus ratio QEMU reports (4):
 
-## Configurar a VM no UTM
+- **OpenCore 0.6.6/0.6.7 in Automatic mode** reads the bus ratio from the wrong bits (3 instead of 4), publishes FSB = 1 GHz ÷ 3, and the kernel ends up with 1.333 GHz → **the guest clock runs at 0.75× real time**. CoreAudio then sees the audio device running 33% fast and apps fall silent after a couple of seconds.
+- **OpenCore ≥ 0.6.8 in Automatic mode** publishes the correct 250 MHz → TSC 1.000 GHz, but the **10.6 x86_64 kernel panics** at boot (`commpage no match for last`): it requires a TSC above 1,000,067,800 Hz (`SLOW_TSC_THRESHOLD`).
 
-Em *Som*, escolha **Nenhum**. Em *QEMU → Argumentos*, acrescente um argumento por linha:
+The fix, for any OpenCore version: switch `PlatformInfo` to manual mode with **`DataHub → FSBFrequency = 250050000`**. The kernel then computes 1,000,200,000 Hz: no panic, and the clock is off by only 0.02%.
+
+Check your guest:
+
+```sh
+sysctl machdep.tsc.frequency    # 1333321860-ish = broken (0.75x clock); 1000200000 = fixed
+```
+
+The zip includes `opencore/apply-manual-fsb.sh`, which converts an OpenCore config with `Automatic = true` and `SystemProductName = MacPro5,1` to manual mode. It reproduces exactly what Automatic generates for MacPro5,1 (OpenCore's model database), keeps your serial/MLB/ROM/UUID from `Generic`, adds the fixed FSB, and backs up `config.plist` first. For other models, fill `DataHub`/`PlatformNVRAM`/`SMBIOS` by hand (see OpenCore's `SampleCustom.plist`) with the same `FSBFrequency`.
+
+**Back up your EFI disk on the host before touching OpenCore.**
+
+```sh
+# in the guest, with the OpenCore EFI partition mounted as /Volumes/EFI-LEGACY
+cd QemuHDAAudio-<version>/opencore
+sudo ./apply-manual-fsb.sh /Volumes/EFI-LEGACY
+# reboot, then: sysctl machdep.tsc.frequency  ->  1000200000
+```
+
+## Get the kext
+
+GitHub Actions builds it on every push.
+
+1. Open the repository's **Actions** tab, open the latest `build` run and download the `QemuHDAAudio-…` artifact.
+2. The artifact is a `.zip` holding `QemuHDAAudio-<version>.zip` with the kext and scripts.
+3. On `v*` tags (e.g. `v0.2.0`) the zip is also attached to a Release.
+
+## Configure the VM in UTM
+
+Set *Sound* to **None**. Under *QEMU → Arguments*, add one argument per line:
 
 ```
 -audiodev
@@ -33,52 +61,63 @@ ich9-intel-hda,id=hda0
 hda-output,bus=hda0.0,audiodev=snd0
 ```
 
-`intel-hda` (ICH6) também funciona no lugar de `ich9-intel-hda`. Desinstale o VoodooHDA antes.
+`intel-hda` (ICH6) also works instead of `ich9-intel-hda`. Uninstall VoodooHDA first.
 
-### Taxa de amostragem
+### Sample rate
 
-Por padrão, o QEMU abre a saída CoreAudio do host em **44100 Hz**. O kext também usa 44100 Hz por padrão, então nada é reamostrado no caminho.
+QEMU opens the host's CoreAudio output at **44100 Hz** by default, and the kext defaults to 44100 Hz too, so nothing is resampled.
 
-Se preferir 48 kHz:
+For 48 kHz:
 
-1. Use `coreaudio,id=snd0,out.frequency=48000` no `-audiodev`. O QEMU passa a abrir o dispositivo do host em 48 kHz.
-2. No convidado, em *Configuração de Áudio MIDI*, escolha 48000 Hz para o QEMU HDA Audio.
+1. Use `coreaudio,id=snd0,out.frequency=48000` for `-audiodev`.
+2. In the guest's *Audio MIDI Setup*, set QEMU HDA Audio to 48000 Hz.
 
-As duas taxas precisam coincidir para evitar reamostragem.
+Both rates must match to avoid resampling.
 
-## Instalar no convidado
+## Install in the guest
 
-Copie o zip para o convidado e rode:
+Copy the zip into the guest and run:
 
 ```sh
-unzip QemuHDAAudio-<versão>.zip
-cd QemuHDAAudio-<versão>
+unzip QemuHDAAudio-<version>.zip
+cd QemuHDAAudio-<version>
 sudo ./install.sh
 ```
 
-Depois:
+Then:
 
-1. Em *Preferências do Sistema → Som → Saída*, escolha **QEMU HDA Audio**.
-2. Teste com `afplay /System/Library/Sounds/Submarine.aiff`.
+1. In *System Preferences → Sound → Output*, choose **QEMU HDA Audio**.
+2. Test with `afplay /System/Library/Sounds/Submarine.aiff`.
 
-Para remover, rode `sudo ./uninstall.sh` e reinicie.
+To remove it, run `sudo ./uninstall.sh` and reboot.
 
-## Se não funcionar
+## Troubleshooting
 
 ```sh
 sudo ./collect-logs.sh
 ```
 
-Isso gera um relatório na Mesa com logs, estado do driver e do IORegistry.
+This writes a report to the Desktop with logs, driver state and the IORegistry entries.
 
-Se o som ainda falhar, aumente `QemuHDASampleOffset` no `Info.plist` do kext instalado:
+Settings live in the installed kext's `Info.plist`:
 
 ```
 /System/Library/Extensions/QemuHDAAudio.kext/Contents/Info.plist
 ```
 
-O padrão é 4096 frames (~93 ms a 44,1 kHz). Tente 8192 e reinicie. Os outros ajustes estão documentados no próprio `Info.plist` e no `CLAUDE.md`.
+| Key | Default | Effect |
+|---|---|---|
+| `QemuHDADebug` | 1 | 0 errors only; 1 startup; 2 stream events + stats every 2 s; 3 every codec verb |
+| `QemuHDASampleOffset` | 4096 | frames CoreAudio writes ahead of the DMA (~93 ms). Raise to 8192 if audio still stutters |
+| `QemuHDASampleRate` | 44100 | initial rate (44100 or 48000); match the `-audiodev` frequency |
+| `QemuHDAIdleStopSec` | 0 | seconds of silence before the DMA stops; 0 = keep it running (avoids losing the start of short sounds) |
+| `QemuHDAPollIntervalMs` | 5 | LPIB polling interval |
+| `QemuHDASampleLatency` | 32 | reported latency (A/V sync only) |
 
-## Licença
+After editing: `sudo touch /System/Library/Extensions` and reboot.
 
-Código deste projeto: MIT (veja `LICENSE`). Durante o build são baixados os headers do IOAudioFamily da Apple e o MacKernelSDK (acidanthera), ambos sob APSL 2.0. O binário final inclui a `libkmod.a` do MacKernelSDK.
+If sound stops after ~2 s, check the guest clock first (see above). With `QemuHDADebug` = 2, the stats line should show ~5.4 `wraps` per 2 s at 44.1 kHz; ~7 means the guest clock runs at 0.75×.
+
+## License
+
+This project's code: MIT (see `LICENSE`). The build downloads Apple's IOAudioFamily headers and acidanthera's MacKernelSDK, both APSL 2.0. The final binary includes MacKernelSDK's `libkmod.a`.

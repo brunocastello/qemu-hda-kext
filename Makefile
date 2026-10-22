@@ -126,7 +126,9 @@ zip: kext
 	rm -rf $(BUILD)/dist && mkdir -p $(DIST)
 	cp -R $(KEXT) $(DIST)/
 	cp guest/install.sh guest/uninstall.sh guest/collect-logs.sh $(DIST)/
-	chmod +x $(DIST)/*.sh
+	mkdir -p $(DIST)/opencore
+	cp guest/opencore/apply-manual-fsb.sh guest/opencore/oc-manual-fsb.py $(DIST)/opencore/
+	chmod +x $(DIST)/*.sh $(DIST)/opencore/*
 	cd $(BUILD)/dist && rm -f ../$(KEXT_NAME)-$(VERSION).zip && \
 	  ditto -c -k --sequesterRsrc --keepParent $(KEXT_NAME)-$(VERSION) ../$(KEXT_NAME)-$(VERSION).zip
 	@echo "-> $(BUILD)/$(KEXT_NAME)-$(VERSION).zip"

@@ -109,7 +109,7 @@ Logs: 10.6/10.7 em `/var/log/kernel.log`; 10.8/10.9 em `/var/log/system.log`. Pr
 | Chave | Padrão | Efeito |
 |---|---|---|
 | `QemuHDASampleRate` | 44100 | taxa inicial (44100 ou 48000); deve bater com o `out.frequency` do `-audiodev` (padrão do QEMU: 44100) |
-| `QemuHDADebug` | 2 (temporário, diagnóstico; voltar a 1 quando estabilizar) | 0 erros; 1 startup; 2 eventos do stream + estatísticas a cada 2 s (voltas, polls atrasados, maior intervalo de poll, chamadas de clip/silenciosas, maior clip = buffer de IO do HAL, `lead` = distância DMA→escrita do CoreAudio: ~sample offset se saudável, ~tamanho do ring se o CoreAudio escreve atrasado); 3 cada verbo |
+| `QemuHDADebug` | 1 | 0 erros; 1 startup; 2 eventos do stream + estatísticas a cada 2 s (voltas, polls atrasados, maior intervalo de poll, chamadas de clip/silenciosas, maior clip = buffer de IO do HAL, `lead` = distância DMA→escrita do CoreAudio: ~sample offset se saudável, ~tamanho do ring se o CoreAudio escreve atrasado); 3 cada verbo |
 | `QemuHDASampleOffset` | 4096 | frames que o CoreAudio escreve à frente do DMA (~93 ms a 44,1 kHz). **Principal botão contra a martelada.** Faixa 64–8192 |
 | `QemuHDASampleLatency` | 32 | latência reportada (só sincronia A/V) |
 | `QemuHDAPollIntervalMs` | 5 | intervalo do polling do LPIB |
@@ -142,12 +142,14 @@ Depois de editar: `sudo touch /System/Library/Extensions` e reiniciar (ou `sudo 
 - Recuperação: não havia backup do AS_SL.qcow2 no host. OC 0.6.6 usa como raiz a pasta de onde o OpenCore.efi foi carregado → bootar via OVMF Boot From File `EFI-backup-oc066-20261022-185028/OC/OpenCore.efi`, restaurar EFI/ a partir do backup, aplicar o manual-fsb, reiniciar.
 - **Aplicado no host (2026-10-22 17:05):** AS_SL.qcow2 → raw (qemu-img do Homebrew), montado, EFI/ restaurado do backup 0.6.6, config convertido para manual com FSB 250050000 (só PlatformInfo mudou; serial/MLB/ROM/UUID iguais ao Generic), convertido de volta e copiado para o UTM. Backup do estado anterior (OC 0.6.8, panic): `~/Downloads/AS_SL.qcow2.panic-state`. Log do boot com 0.6.8 confirmou `FSB 250000349Hz` → TSC 1,0000014 GHz < limiar.
 - **Resultado com FSB manual (2026-10-22 19:09+):** boota, `machdep.tsc.frequency = 1000200000`. QuickTime com som contínuo e vídeo fluido, alertas ok, `say` da frase longa completo (6,76 s). Stats: ~5–6 voltas/2 s (era 7), `silent` baixo, `lead` 4400–4700. Pendente: `say -v Alex "Hello from Alex"` (frase curta, antes do teste longo) falou só "Hello" — sessão de 25358 frames (~0,57 s); verificar se é reproduzível (hipótese: perda no início/fim do stream — FIFO de 8 KiB do QEMU antes do host começar a puxar, ou DMA parado logo ao fim).
+- **0.1.3 (DMA contínuo entre sons, timestamp inicial ancorado no LPIB):** resolveu frases curtas cortadas ("Hello fro...ex", "One" de "One, two, three"). Causa: a cada start o DMA (e o stream do QEMU para o host) recomeçava do zero e o "frame 0 = agora" ficava errado até a 1ª volta (~0,37 s).
+- **Confirmado pelo usuário (2026-10-22, 10.6.8):** alertas, `say` curto e longo, QuickTime e MP3 no iTunes, tudo ok. Decisão: **manter OpenCore 0.6.6** com FSB manual (a correção vale para qualquer versão; 0.6.8 só traria risco de config). Documentado no README (em inglês); scripts em `guest/opencore/` e no zip. 0.2.0: `QemuHDADebug` volta a 1.
 - 0.1.2: zera ring e mix buffer no start do engine (estalo antes de cada som). no convidado vs cronômetro no host e `sysctl machdep.tsc hw.busfrequency`; se confirmado, corrigir FSBFrequency (DataHub do OpenCore) em vez de mexer no driver.
 
 ## Próximos passos
 
-- ~~Primeiro build no Actions~~ (ok).
-- Testar no 10.6.8; depois 10.7, 10.8, 10.9 (mesmo binário).
+- ~~Primeiro build no Actions~~ (ok). ~~10.6.8~~ (ok, com o relógio corrigido).
+- Testar 10.7, 10.8, 10.9 (mesmo binário; verificar `machdep.tsc.frequency` e se o limiar de TSC do commpage também existe).
 - Se ficar bom: gerenciamento de energia (sleep/wake), entrada (`hda-duplex`).
 
 ## Convenções

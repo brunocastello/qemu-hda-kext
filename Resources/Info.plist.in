@@ -46,7 +46,7 @@
 			<!-- 0 = errors only, 1 = startup info, 2 = stream events + stats every 10 s,
 			     3 = every codec verb -->
 			<key>QemuHDADebug</key>
-			<integer>2</integer>
+			<integer>1</integer>
 			<!-- Initial sample rate: 44100 or 48000. Match QEMU's -audiodev
 			     out.frequency (QEMU's default is 44100) so QEMU does not have to
 			     resample. Can also be changed at runtime in Audio MIDI Setup. -->
