@@ -15,6 +15,8 @@ OUT="$HOME/Desktop/qemuhda-report-$(date +%Y%m%d-%H%M%S).txt"
         grep -i "QemuHDAAudio" /var/log/kernel.log | tail -200
     fi
     grep -i "QemuHDAAudio" /var/log/system.log 2>/dev/null | tail -200
+    echo; echo "=== CoreAudio / QuickTime messages (system.log)"
+    grep -iE "coreaudiod|HAL|AudioQueue|QuickTime|overload" /var/log/system.log 2>/dev/null | grep -v QemuHDAAudio | tail -60
     echo; echo "=== kextutil -n -t"
     for d in /System/Library/Extensions /Library/Extensions; do
         [ -d "$d/QemuHDAAudio.kext" ] && kextutil -n -t "$d/QemuHDAAudio.kext" 2>&1

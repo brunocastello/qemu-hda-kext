@@ -58,6 +58,8 @@ private:
     static void timerFired(OSObject *owner, IOTimerEventSource *sender);
     void   pollPosition();
     void   resetPositionTracking();
+    void   resetClipStats();
+    void   logStats(const char *what, UInt32 pos);
     bool   createControls();
 
     QemuHDAAudioDevice  *fDevice;
@@ -77,6 +79,17 @@ private:
     UInt64               fStatsStart;   /* abs time */
     UInt32               fWraps;
     UInt32               fLatePolls;
+
+    /* clip statistics (debug level >= 2), reset every stats period.
+     * "lead" = frames between the DMA read position and the first frame
+     * CoreAudio clips, modulo the ring: ~sample offset when healthy, close
+     * to the ring size when CoreAudio writes behind the DMA (too late). */
+    UInt32               fClipCalls;
+    UInt32               fClipSilent;   /* calls whose mix data was all zero */
+    UInt64               fClipFrames;
+    UInt32               fClipMaxFrames;
+    UInt32               fLeadMin;
+    UInt32               fLeadMax;
 };
 
 #define QHDA_VOLUME_MAX 64   /* 0.75 dB per step, 0 = -inf, 1 = -47.25 dB */

@@ -109,7 +109,7 @@ Logs: 10.6/10.7 em `/var/log/kernel.log`; 10.8/10.9 em `/var/log/system.log`. Pr
 | Chave | Padrão | Efeito |
 |---|---|---|
 | `QemuHDASampleRate` | 44100 | taxa inicial (44100 ou 48000); deve bater com o `out.frequency` do `-audiodev` (padrão do QEMU: 44100) |
-| `QemuHDADebug` | 1 | 0 erros; 1 startup; 2 eventos do stream + estatísticas a cada 10 s (voltas, polls atrasados, maior intervalo de poll); 3 cada verbo |
+| `QemuHDADebug` | 2 (temporário, diagnóstico; voltar a 1 quando estabilizar) | 0 erros; 1 startup; 2 eventos do stream + estatísticas a cada 2 s (voltas, polls atrasados, maior intervalo de poll, chamadas de clip/silenciosas, maior clip = buffer de IO do HAL, `lead` = distância DMA→escrita do CoreAudio: ~sample offset se saudável, ~tamanho do ring se o CoreAudio escreve atrasado); 3 cada verbo |
 | `QemuHDASampleOffset` | 4096 | frames que o CoreAudio escreve à frente do DMA (~93 ms a 44,1 kHz). **Principal botão contra a martelada.** Faixa 64–8192 |
 | `QemuHDASampleLatency` | 32 | latência reportada (só sincronia A/V) |
 | `QemuHDAPollIntervalMs` | 5 | intervalo do polling do LPIB |

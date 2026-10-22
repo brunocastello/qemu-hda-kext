@@ -23,7 +23,7 @@ OSDefineMetaClassAndStructors(QemuHDAAudioEngine, IOAudioEngine)
     do { if (fDevice && fDevice->getDebugLevel() >= (lvl)) \
          IOLog("QemuHDAAudio: " fmt "\n", ## args); } while (0)
 
-#define QHDA_STATS_PERIOD_NS (10ULL * 1000000000ULL)
+#define QHDA_STATS_PERIOD_NS (2ULL * 1000000000ULL)
 
 static inline UInt64 absToNs(UInt64 abs)
 {
@@ -215,8 +215,9 @@ IOReturn QemuHDAAudioEngine::performAudioEngineStop()
         fTimer->cancelTimeout();
     }
     fDevice->stopOutputStream();
-    QLOG(2, "engine stopped (wraps %u, late polls %u, max poll gap %llu us)",
-         (unsigned)fWraps, (unsigned)fLatePolls, (unsigned long long)(fMaxPollGapNs / 1000));
+    if (fDevice->getDebugLevel() >= 2) {
+        logStats("engine stopped", fDevice->readOutputPositionBytes());
+    }
     return kIOReturnSuccess;
 }
 
@@ -269,6 +270,7 @@ void QemuHDAAudioEngine::resetPositionTracking()
     fMaxPollGapNs = 0;
     fWraps        = 0;
     fLatePolls    = 0;
+    resetClipStats();
 
     /* Sample frame 0 is being played now. */
     takeTimeStamp(false);
@@ -343,13 +345,32 @@ void QemuHDAAudioEngine::pollPosition()
     fLastPosBytes = pos;
 
     if (fDevice->getDebugLevel() >= 2 && absToNs(now - fStatsStart) >= QHDA_STATS_PERIOD_NS) {
-        IOLog("QemuHDAAudio: stats: wraps %u, late polls %u, max poll gap %llu us, pos %u\n",
-              (unsigned)fWraps, (unsigned)fLatePolls,
-              (unsigned long long)(fMaxPollGapNs / 1000), (unsigned)pos);
+        logStats("stats", pos);
         fStatsStart   = now;
         fMaxPollGapNs = 0;
         fLatePolls    = 0;
+        resetClipStats();
     }
+}
+
+void QemuHDAAudioEngine::resetClipStats()
+{
+    fClipCalls     = 0;
+    fClipSilent    = 0;
+    fClipFrames    = 0;
+    fClipMaxFrames = 0;
+    fLeadMin       = 0xFFFFFFFF;
+    fLeadMax       = 0;
+}
+
+void QemuHDAAudioEngine::logStats(const char *what, UInt32 pos)
+{
+    IOLog("QemuHDAAudio: %s: wraps %u, late polls %u, max poll gap %llu us, pos %u | "
+          "clips %u (silent %u), frames %llu, max clip %u, lead %u..%u\n",
+          what, (unsigned)fWraps, (unsigned)fLatePolls,
+          (unsigned long long)(fMaxPollGapNs / 1000), (unsigned)pos,
+          (unsigned)fClipCalls, (unsigned)fClipSilent, (unsigned long long)fClipFrames,
+          (unsigned)fClipMaxFrames, (unsigned)(fClipCalls ? fLeadMin : 0), (unsigned)fLeadMax);
 }
 
 /* ---- Controls ----------------------------------------------------------- */
@@ -390,8 +411,20 @@ IOReturn QemuHDAAudioEngine::clipOutputSamples(const void *mixBuf, void *sampleB
     if (vol < 0) vol = 0;
     if (vol > QHDA_VOLUME_MAX) vol = QHDA_VOLUME_MAX;
     const float gain = fMuted ? 0.0f : kQemuHDAGainTable[vol];
+    bool silent = true;
+
+    if (fDevice->getDebugLevel() >= 2) {
+        UInt32 dmaFrame = fDevice->readOutputPositionBytes() / QHDA_BYTES_PER_FRAME;
+        UInt32 lead = (firstSampleFrame + QHDA_NUM_FRAMES - dmaFrame) % QHDA_NUM_FRAMES;
+        fClipCalls++;
+        fClipFrames += numSampleFrames;
+        if (numSampleFrames > fClipMaxFrames) fClipMaxFrames = numSampleFrames;
+        if (lead < fLeadMin) fLeadMin = lead;
+        if (lead > fLeadMax) fLeadMax = lead;
+    }
 
     for (UInt32 i = 0; i < count; i++) {
+        if (in[i] != 0.0f) silent = false;
         float s = in[i] * gain;
         if (s > 1.0f) {
             s = 1.0f;
@@ -399,6 +432,9 @@ IOReturn QemuHDAAudioEngine::clipOutputSamples(const void *mixBuf, void *sampleB
             s = -1.0f;
         }
         out[i] = (SInt16)(s * 32767.0f);
+    }
+    if (silent && fDevice->getDebugLevel() >= 2) {
+        fClipSilent++;
     }
     return kIOReturnSuccess;
 }
