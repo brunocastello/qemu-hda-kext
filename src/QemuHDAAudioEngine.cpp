@@ -192,6 +192,16 @@ void QemuHDAAudioEngine::stop(IOService *provider)
 
 IOReturn QemuHDAAudioEngine::performAudioEngineStart()
 {
+    /* The DMA restarts at frame 0, but the ring and the mix buffer still
+     * hold whatever was written ahead of the play head before the last
+     * stop; without this, every start plays a burst of stale audio. */
+    if (fOutStream) {
+        void *buf = fOutStream->getSampleBuffer();
+        if (buf) bzero(buf, fOutStream->getSampleBufferSize());
+        buf = fOutStream->getMixBuffer();
+        if (buf) bzero(buf, fOutStream->getMixBufferSize());
+    }
+
     IOReturn r = fDevice->startOutputStream();
     if (r != kIOReturnSuccess) {
         QLOG(0, "cannot start output stream: 0x%x", r);
