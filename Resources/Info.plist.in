@@ -63,6 +63,10 @@
 			<!-- LPIB polling interval for buffer-wrap timestamps, in ms (1..50). -->
 			<key>QemuHDAPollIntervalMs</key>
 			<integer>5</integer>
+			<!-- Seconds of silence after which the DMA stream is stopped; 0 = keep it
+			     running (avoids QEMU's stream start-up at the start of every sound). -->
+			<key>QemuHDAIdleStopSec</key>
+			<integer>0</integer>
 			<!-- 1 = accept a non-QEMU codec (testing only). -->
 			<key>QemuHDAAllowAnyCodec</key>
 			<integer>0</integer>

@@ -113,6 +113,7 @@ Logs: 10.6/10.7 em `/var/log/kernel.log`; 10.8/10.9 em `/var/log/system.log`. Pr
 | `QemuHDASampleOffset` | 4096 | frames que o CoreAudio escreve à frente do DMA (~93 ms a 44,1 kHz). **Principal botão contra a martelada.** Faixa 64–8192 |
 | `QemuHDASampleLatency` | 32 | latência reportada (só sincronia A/V) |
 | `QemuHDAPollIntervalMs` | 5 | intervalo do polling do LPIB |
+| `QemuHDAIdleStopSec` | 0 | segundos de silêncio até parar o DMA; 0 = DMA sempre rodando entre sons (evita perder o começo de sons curtos) |
 | `QemuHDAAllowAnyCodec` | 0 | aceitar codec não-QEMU (só teste) |
 
 Depois de editar: `sudo touch /System/Library/Extensions` e reiniciar (ou `sudo kextunload -b org.qemuhda.driver.QemuHDAAudio && sudo kextload …`).

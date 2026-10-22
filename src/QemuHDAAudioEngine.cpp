@@ -46,10 +46,12 @@ bool QemuHDAAudioEngine::init(QemuHDAAudioDevice *device)
     if (!device || !super::init(NULL)) {
         return false;
     }
-    fDevice  = device;
-    fVolume  = QHDA_VOLUME_MAX;
-    fMuted   = false;
-    fRunning = false;
+    fDevice      = device;
+    fVolume      = QHDA_VOLUME_MAX;
+    fMuted       = false;
+    fRunning     = false;
+    fDMAActive   = false;
+    fIdleErasing = false;
     return true;
 }
 
@@ -74,6 +76,7 @@ bool QemuHDAAudioEngine::initHardware(IOService *provider)
     UInt32 sampleOffset  = fDevice->getUIntProperty("QemuHDASampleOffset", 4096, 64, QHDA_NUM_FRAMES / 2);
     UInt32 sampleLatency = fDevice->getUIntProperty("QemuHDASampleLatency", 32, 0, 8192);
     fPollMs              = fDevice->getUIntProperty("QemuHDAPollIntervalMs", 5, 1, 50);
+    fIdleStopSec         = fDevice->getUIntProperty("QemuHDAIdleStopSec", 0, 0, 3600);
 
     rate.whole = fDevice->getOutputRate();
     rate.fraction = 0;
@@ -176,6 +179,9 @@ bool QemuHDAAudioEngine::createControls()
 
 void QemuHDAAudioEngine::stop(IOService *provider)
 {
+    if (fDMAActive) {
+        stopDMA();
+    }
     if (fTimer) {
         fTimer->cancelTimeout();
         IOWorkLoop *wl = getWorkLoop();
@@ -190,16 +196,12 @@ void QemuHDAAudioEngine::stop(IOService *provider)
 
 /* ---- Start / stop ------------------------------------------------------- */
 
-IOReturn QemuHDAAudioEngine::performAudioEngineStart()
+IOReturn QemuHDAAudioEngine::startDMA()
 {
-    /* The DMA restarts at frame 0, but the ring and the mix buffer still
-     * hold whatever was written ahead of the play head before the last
-     * stop; without this, every start plays a burst of stale audio. */
+    /* A fresh DMA start begins at frame 0 of a silent ring. */
     if (fOutStream) {
         void *buf = fOutStream->getSampleBuffer();
         if (buf) bzero(buf, fOutStream->getSampleBufferSize());
-        buf = fOutStream->getMixBuffer();
-        if (buf) bzero(buf, fOutStream->getMixBufferSize());
     }
 
     IOReturn r = fDevice->startOutputStream();
@@ -207,28 +209,108 @@ IOReturn QemuHDAAudioEngine::performAudioEngineStart()
         QLOG(0, "cannot start output stream: 0x%x", r);
         return r;
     }
-
-    resetPositionTracking();
-
-    fRunning = true;
+    fDMAActive   = true;
+    fIdleErasing = false;
     if (fTimer) {
         fTimer->setTimeoutMS(fPollMs);
     }
-    QLOG(2, "engine started");
+    return kIOReturnSuccess;
+}
+
+void QemuHDAAudioEngine::stopDMA()
+{
+    if (fTimer) {
+        fTimer->cancelTimeout();
+    }
+    fDevice->stopOutputStream();
+    fDMAActive   = false;
+    fIdleErasing = false;
+}
+
+IOReturn QemuHDAAudioEngine::performAudioEngineStart()
+{
+    bool resumed = fDMAActive;
+
+    if (!fDMAActive) {
+        IOReturn r = startDMA();
+        if (r != kIOReturnSuccess) {
+            return r;
+        }
+    }
+    fIdleErasing = false;
+
+    /* The mix buffer still holds what the previous session mixed ahead of
+     * the play head; clients add into it, so it must start out silent. The
+     * ring itself is already silent behind the DMA (idle erase), and the
+     * part ahead of it is the tail of the previous sound, still playing. */
+    if (fOutStream) {
+        void *buf = fOutStream->getMixBuffer();
+        if (buf) bzero(buf, fOutStream->getMixBufferSize());
+    }
+
+    resetPositionTracking();
+    fRunning = true;
+    QLOG(2, "engine started (%s DMA)", resumed ? "running" : "new");
     return kIOReturnSuccess;
 }
 
 IOReturn QemuHDAAudioEngine::performAudioEngineStop()
 {
     fRunning = false;
-    if (fTimer) {
-        fTimer->cancelTimeout();
-    }
-    fDevice->stopOutputStream();
+
+    /* Keep the DMA running: what CoreAudio wrote ahead of the play head
+     * (about the sample offset) still gets played, and the next start
+     * finds a steady stream. Erase behind the DMA from here on. */
+    fIdleErasePos    = fDevice->readOutputPositionBytes();
+    fIdleErasedBytes = 0;
+    fIdleErasing     = true;
+    clock_get_uptime(&fIdleSince);
+
     if (fDevice->getDebugLevel() >= 2) {
-        logStats("engine stopped", fDevice->readOutputPositionBytes());
+        logStats("engine stopped", fIdleErasePos);
     }
     return kIOReturnSuccess;
+}
+
+void QemuHDAAudioEngine::eraseSamples(UInt32 fromBytes, UInt32 toBytes)
+{
+    UInt8 *ring = fOutStream ? (UInt8 *)fOutStream->getSampleBuffer() : NULL;
+    if (!ring) {
+        return;
+    }
+    if (toBytes >= fromBytes) {
+        bzero(ring + fromBytes, toBytes - fromBytes);
+    } else {
+        bzero(ring + fromBytes, QHDA_BUFFER_BYTES - fromBytes);
+        bzero(ring, toBytes);
+    }
+}
+
+void QemuHDAAudioEngine::idlePoll()
+{
+    UInt32 pos = fDevice->readOutputPositionBytes();
+
+    if (fIdleErasing) {
+        UInt32 advanced = (pos + QHDA_BUFFER_BYTES - fIdleErasePos) % QHDA_BUFFER_BYTES;
+        eraseSamples(fIdleErasePos, pos);
+        fIdleErasePos     = pos;
+        fIdleErasedBytes += advanced;
+        if (fIdleErasedBytes >= QHDA_BUFFER_BYTES) {
+            /* The DMA went once around the ring since the stop: all of it,
+             * including the tail that was ahead of the play head, has been
+             * played and erased. */
+            fIdleErasing = false;
+        }
+    }
+
+    if (fIdleStopSec) {
+        UInt64 now;
+        clock_get_uptime(&now);
+        if (absToNs(now - fIdleSince) >= (UInt64)fIdleStopSec * 1000000000ULL) {
+            stopDMA();      /* startDMA() clears the ring before restarting */
+            QLOG(2, "output stream idle for %u s, DMA stopped", (unsigned)fIdleStopSec);
+        }
+    }
 }
 
 UInt32 QemuHDAAudioEngine::getCurrentSampleFrame()
@@ -251,39 +333,44 @@ IOReturn QemuHDAAudioEngine::performFormatChange(IOAudioStream *audioStream,
     QLOG(1, "sample rate change %u -> %u Hz", (unsigned)fDevice->getOutputRate(),
          (unsigned)newSampleRate->whole);
 
-    /* The HDA stream format may only change while the stream is stopped. */
-    bool wasRunning = fRunning;
-    if (wasRunning) {
-        fRunning = false;
-        if (fTimer) fTimer->cancelTimeout();
-        fDevice->stopOutputStream();
+    /* The HDA stream format may only change while the stream is stopped.
+     * An idle (silent) DMA is simply left stopped until the next start. */
+    if (fDMAActive) {
+        stopDMA();
     }
     fDevice->setOutputRate(newSampleRate->whole);
-    if (wasRunning) {
-        IOReturn r = fDevice->startOutputStream();
+    if (fRunning) {
+        IOReturn r = startDMA();
         if (r != kIOReturnSuccess) {
             QLOG(0, "cannot restart output stream after rate change: 0x%x", r);
+            fRunning = false;
             return r;
         }
         resetPositionTracking();
-        fRunning = true;
-        if (fTimer) fTimer->setTimeoutMS(fPollMs);
     }
     return kIOReturnSuccess;
 }
 
 void QemuHDAAudioEngine::resetPositionTracking()
 {
-    fLastPosBytes = 0;
-    clock_get_uptime(&fLastPollTime);
-    fStatsStart   = fLastPollTime;
+    UInt64 now;
+    UInt32 pos = fDevice->readOutputPositionBytes();
+    const UInt64 bytesPerSec = (UInt64)fDevice->getOutputRate() * QHDA_BYTES_PER_FRAME;
+
+    clock_get_uptime(&now);
+    fLastPosBytes = pos;
+    fLastPollTime = now;
+    fStatsStart   = now;
     fMaxPollGapNs = 0;
     fWraps        = 0;
     fLatePolls    = 0;
     resetClipStats();
 
-    /* Sample frame 0 is being played now. */
-    takeTimeStamp(false);
+    /* Loop 0 began when the DMA was last at frame 0: 'pos' bytes ago. On a
+     * fresh start pos is ~0; on a resumed (already running) DMA this
+     * anchors CoreAudio to the real, steady position right away. */
+    AbsoluteTime ts = now - nsToAbs((UInt64)pos * 1000000000ULL / bytesPerSec);
+    takeTimeStamp(false, &ts);
 }
 
 /* ---- Position polling / timestamps -------------------------------------- */
@@ -291,11 +378,15 @@ void QemuHDAAudioEngine::resetPositionTracking()
 void QemuHDAAudioEngine::timerFired(OSObject *owner, IOTimerEventSource *sender)
 {
     QemuHDAAudioEngine *self = OSDynamicCast(QemuHDAAudioEngine, owner);
-    if (!self || !self->fRunning) {
+    if (!self || !self->fDMAActive) {
         return;
     }
-    self->pollPosition();
-    if (self->fRunning && sender) {
+    if (self->fRunning) {
+        self->pollPosition();
+    } else {
+        self->idlePoll();
+    }
+    if (self->fDMAActive && sender) {
         sender->setTimeoutMS(self->fPollMs);
     }
 }

@@ -58,6 +58,10 @@ private:
     static void timerFired(OSObject *owner, IOTimerEventSource *sender);
     void   pollPosition();
     void   resetPositionTracking();
+    IOReturn startDMA();
+    void   stopDMA();
+    void   idlePoll();
+    void   eraseSamples(UInt32 fromBytes, UInt32 toBytes);
     void   resetClipStats();
     void   logStats(const char *what, UInt32 pos);
     bool   createControls();
@@ -68,7 +72,18 @@ private:
 
     UInt32               fPollMs;
     UInt32               fLastPosBytes;
-    bool                 fRunning;
+    bool                 fRunning;      /* IOAudioEngine started (clients active) */
+
+    /* The DMA keeps running (playing silence) between engine stop and the
+     * next start, so a start does not pay QEMU's stream start-up and the
+     * first timestamp comes from an already steady LPIB. While idle, the
+     * poll timer erases the ring behind the DMA position. */
+    bool                 fDMAActive;
+    bool                 fIdleErasing;
+    UInt32               fIdleErasePos;     /* bytes */
+    UInt32               fIdleErasedBytes;
+    UInt64               fIdleSince;        /* abs time */
+    UInt32               fIdleStopSec;      /* 0 = keep the DMA running */
 
     volatile SInt32      fVolume;       /* 0 .. QHDA_VOLUME_MAX */
     volatile bool        fMuted;
