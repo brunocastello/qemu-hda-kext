@@ -405,11 +405,36 @@ bool QemuHDAAudioDevice::discoverCodec()
     return true;
 }
 
+/* QEMU's device reset (warm reboot) clears the stream descriptors without
+ * telling the codec that their DMA stopped, so hda-codec keeps a per-tag
+ * "running" flag from the previous boot (our output DMA runs while idle).
+ * Binding a converter to that tag then marks it running before its DMA
+ * starts, and the next SET_STREAM_FORMAT deletes the transfer timer
+ * without clearing the flag: the RUN bit becomes a no-op and the stream
+ * never moves. Detach the converters, then run and stop each of our tags
+ * so the controller clears the flag. */
+void QemuHDAAudioDevice::clearStaleStreamState()
+{
+    for (int d = 0; d < kQemuHDANumDirections; d++) {
+        StreamState *st = &fStream[d];
+        if (!st->present) continue;
+
+        codecCommand(st->converter, HDA_VERB_SET_CHANNEL_STREAMID, 0, NULL);
+
+        UInt32 ctl = st->tag << HDA_SD_CTL_STRM_SHIFT;
+        wr32(st->sdBase + HDA_SD_CTL, ctl);
+        wr32(st->sdBase + HDA_SD_CTL, ctl | HDA_SD_CTL_RUN);
+        wr32(st->sdBase + HDA_SD_CTL, ctl);
+    }
+}
+
 bool QemuHDAAudioDevice::configureCodec()
 {
     StreamState *out = &fStream[kQemuHDAOutput];
     StreamState *in  = &fStream[kQemuHDAInput];
     bool ok = true;
+
+    clearStaleStreamState();
 
     ok &= codecCommand(fAFG, HDA_VERB_SET_POWER_STATE, 0, NULL);   /* D0 */
     ok &= codecCommand(out->converter, HDA_VERB_SET_POWER_STATE, 0, NULL);
@@ -424,8 +449,10 @@ bool QemuHDAAudioDevice::configureCodec()
                             (out->ampSteps & 0x7F), NULL);
     }
 
-    ok &= codecCommand(out->converter, HDA_VERB_SET_CHANNEL_STREAMID, (out->tag << 4) | 0, NULL);
+    /* Format before stream ID: in QEMU, SET_STREAM_FORMAT stops the
+     * converter's transfer timer and only binding the tag restarts it. */
     ok &= codecCommand4(out->converter, HDA_VERB_SET_STREAM_FORMAT, out->formatWord, NULL);
+    ok &= codecCommand(out->converter, HDA_VERB_SET_CHANNEL_STREAMID, (out->tag << 4) | 0, NULL);
 
     if (!ok) {
         QLOG(0, "codec configuration failed");
@@ -444,8 +471,8 @@ bool QemuHDAAudioDevice::configureCodec()
                                   HDA_AMP_SET_INPUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT |
                                   (in->ampSteps & 0x7F), NULL);
         }
-        inOk &= codecCommand(in->converter, HDA_VERB_SET_CHANNEL_STREAMID, (in->tag << 4) | 0, NULL);
         inOk &= codecCommand4(in->converter, HDA_VERB_SET_STREAM_FORMAT, in->formatWord, NULL);
+        inOk &= codecCommand(in->converter, HDA_VERB_SET_CHANNEL_STREAMID, (in->tag << 4) | 0, NULL);
         if (!inOk) {
             QLOG(0, "input path configuration failed; input disabled");
             in->present = false;
@@ -578,8 +605,8 @@ IOReturn QemuHDAAudioDevice::startStream(QemuHDADirection dir)
 
     /* Re-assert the codec side every time: cheap, and robust against a
      * codec reset while we were stopped. */
-    codecCommand(st->converter, HDA_VERB_SET_CHANNEL_STREAMID, (st->tag << 4) | 0, NULL);
     codecCommand4(st->converter, HDA_VERB_SET_STREAM_FORMAT, st->formatWord, NULL);
+    codecCommand(st->converter, HDA_VERB_SET_CHANNEL_STREAMID, (st->tag << 4) | 0, NULL);
 
     UInt32 ctl = st->tag << HDA_SD_CTL_STRM_SHIFT;
     wr32(sd + HDA_SD_CTL, ctl);

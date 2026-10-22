@@ -97,6 +97,7 @@ private:
     bool   allocateDMABuffers(QemuHDADirection dir);
     void   freeDMABuffers();
     bool   discoverCodec();
+    void   clearStaleStreamState();
     bool   configureCodec();
     bool   resetStream(QemuHDADirection dir);
     bool   reinitAfterWake();
